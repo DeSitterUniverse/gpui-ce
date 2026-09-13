@@ -193,7 +193,7 @@ fn apply_auto_size(
         Length::Definite(DefiniteLength::Absolute(length)) => {
             Some(length.to_pixels(context.rem_size))
         }
-        Length::Definite(DefiniteLength::Fraction(_)) => None,
+        Length::Definite(DefiniteLength::Relative(_)) => None,
         Length::Auto => state.resolved_auto,
     };
 
@@ -383,7 +383,7 @@ fn apply_inset(
         Length::Auto => state.resolved_auto,
         Length::Definite(length) => match length {
             DefiniteLength::Absolute(length) => Some(length.to_pixels(context.rem_size)),
-            DefiniteLength::Fraction(_) => state.containing_size.map(|containing_size| {
+            DefiniteLength::Relative(_) => state.containing_size.map(|containing_size| {
                 length.to_pixels(AbsoluteLength::Pixels(containing_size), context.rem_size)
             }),
         },
@@ -497,7 +497,7 @@ mod tests {
         AbsoluteLength, AnyWindowHandle, Bounds, Corners, DefiniteLength, DurationWithEasing,
         Edges, FocusHandle, InputEvent as _, Length, MouseButton, MouseDownEvent, MouseUpEvent,
         Pixels, Style, TestAppContext, Window, canvas, div, ease_in_out, point, prelude::*, px,
-        rems, size,
+        relative, rems, size,
     };
 
     fn length(value: f32) -> Length {
@@ -672,12 +672,7 @@ mod tests {
                 Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Rems(rems(1.0)))),
                 33.0,
             ),
-            (
-                Edge::Bottom,
-                45.0,
-                Length::Definite(DefiniteLength::Fraction(0.25)),
-                32.5,
-            ),
+            (Edge::Bottom, 45.0, relative(0.25).into(), 32.5),
             (Edge::Left, 20.0, length(10.0), 15.0),
         ] {
             let transitions = edge.transitions(duration);
