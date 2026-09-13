@@ -66,7 +66,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         background,
         border_color,
         corner_radii,
-        border_widths
+        border_widths,
+        corner_smoothing,
+        padding
     ),
     layout!(
         Shadow,
@@ -80,7 +82,7 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         element_bounds,
         element_corner_radii,
         inset,
-        padding
+        corner_smoothing
     ),
     layout!(
         Underline,
@@ -119,9 +121,9 @@ pub const SCENE_BUFFER_LAYOUTS: &[SceneBufferLayout] = &[
         PolychromeSprite,
         "PolychromeSprite",
         order,
-        padding,
         grayscale,
         opacity,
+        corner_smoothing,
         bounds,
         content_mask,
         corner_radii,
