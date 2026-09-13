@@ -319,6 +319,12 @@ pub struct Style {
     /// The border style of this element
     pub border_style: BorderStyle,
 
+    /// The length of each border dash, as a multiple of the border width.
+    pub border_dashed_length: f32,
+
+    /// The gap between border dashes, as a multiple of the border width.
+    pub border_dashed_gap: f32,
+
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
@@ -880,14 +886,19 @@ impl Style {
                 let border_widths = self.border_widths.to_pixels(rem_size);
                 let mut background = self.border_color.unwrap_or_default();
                 background.alpha = 0.;
-                window.paint_quad(quad(
-                    bounds,
-                    corner_radii,
-                    background,
-                    border_widths,
-                    self.border_color.unwrap_or_default(),
-                    self.border_style,
-                ));
+
+                window.paint_quad(
+                    quad(
+                        bounds,
+                        corner_radii,
+                        background,
+                        border_widths,
+                        self.border_color.unwrap_or_default(),
+                        self.border_style,
+                    )
+                    .border_dashed_length(self.border_dashed_length)
+                    .border_dashed_gap(self.border_dashed_gap),
+                );
             }
         };
 
@@ -947,6 +958,8 @@ impl Default for Style {
             background: None,
             border_color: None,
             border_style: BorderStyle::default(),
+            border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+            border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             ring: Default::default(),
@@ -1655,6 +1668,33 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+
+    #[test]
+    fn dashed_border_pattern_has_legacy_defaults_and_refines_independently() {
+        let mut style = Style::default();
+
+        assert_eq!(
+            style.border_dashed_length,
+            crate::scene::DEFAULT_BORDER_DASHED_LENGTH
+        );
+        assert_eq!(
+            style.border_dashed_gap,
+            crate::scene::DEFAULT_BORDER_DASHED_GAP
+        );
+
+        style.refine(
+            &StyleRefinement::default()
+                .border_dashed_length(4.0)
+                .border_dashed_gap(0.5),
+        );
+
+        assert_eq!(style.border_dashed_length, 4.0);
+        assert_eq!(style.border_dashed_gap, 0.5);
+        assert_eq!(style.border_style, BorderStyle::Solid);
+
+        style.refine(&StyleRefinement::default().border_dashed());
+        assert_eq!(style.border_style, BorderStyle::Dashed);
     }
 
     #[test]

@@ -4332,6 +4332,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            border_dashed_length: quad.border_dashed_length,
+            border_dashed_gap: quad.border_dashed_gap,
         };
 
         if !quad.background.is_transparent() {
@@ -7265,6 +7267,10 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// The length of each border dash, as a multiple of the border width.
+    pub border_dashed_length: f32,
+    /// The gap between border dashes, as a multiple of the border width.
+    pub border_dashed_gap: f32,
 }
 
 impl PaintQuad {
@@ -7299,6 +7305,22 @@ impl PaintQuad {
             ..self
         }
     }
+
+    /// Sets the length of each border dash as a multiple of the border width.
+    pub fn border_dashed_length(self, length_per_border_width: f32) -> Self {
+        PaintQuad {
+            border_dashed_length: length_per_border_width.max(0.0),
+            ..self
+        }
+    }
+
+    /// Sets the gap between border dashes as a multiple of the border width.
+    pub fn border_dashed_gap(self, gap_per_border_width: f32) -> Self {
+        PaintQuad {
+            border_dashed_gap: gap_per_border_width.max(0.0),
+            ..self
+        }
+    }
 }
 
 /// Creates a quad with the given parameters.
@@ -7317,6 +7339,8 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into_color(),
         border_style,
+        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 
@@ -7329,6 +7353,8 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 
@@ -7345,6 +7371,8 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into_color(),
         border_style,
+        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 
