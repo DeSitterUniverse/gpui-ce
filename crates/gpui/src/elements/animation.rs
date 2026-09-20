@@ -3,7 +3,7 @@ use std::{cell::Cell, rc::Rc, time::Duration};
 
 use crate::{
     AnyElement, App, AppContext, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, Motion, ParentElement, Repeat, SpringAnimation, SpringConfig, SpringDescription,
+    IntoElement, Motion, ParentElement, SpringAnimation, SpringConfig, SpringDescription,
     SpringPlayback, SpringState, SpringTarget, Window,
 };
 
@@ -36,13 +36,13 @@ impl Animation {
 
     /// Set the animation to loop when it finishes.
     pub fn repeat(mut self) -> Self {
-        self.motion.repeat = Repeat::Forever;
+        self.motion = self.motion.repeat_forever();
         self
     }
 
     /// Set the animation to loop when it finishes, phase-locked to a clock shared by the whole [`App`].
     pub fn repeat_synced(mut self) -> Self {
-        self.motion.repeat = Repeat::Forever;
+        self.motion = self.motion.repeat_forever();
         self.synced = true;
         self
     }
