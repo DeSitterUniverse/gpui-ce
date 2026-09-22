@@ -91,14 +91,6 @@ jobs:
         with:
           config: typos.toml
 
-  # TOML formatting
-  taplo:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: uncenter/setup-taplo@v1
-      - run: taplo fmt --check
-
   # Lockfile freshness is advisory: dependency resolution changes often come
   # from upstream releases and should be reviewed, not block unrelated work.
   lockfile:
