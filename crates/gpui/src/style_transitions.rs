@@ -57,10 +57,9 @@ impl<T> StyleTransitionEvaluation<T> {
         }
     }
 
-    /// Under Motion's normalized presentation contract, an inactive END sample
-    /// represents the authored target. Other inactive progress intentionally
-    /// preserves a settled presentation, such as the origin after an even
-    /// number of alternating iterations or a custom easing endpoint.
+    /// An inactive sample at Progress::END presents the authored target.
+    /// Other inactive progress retains the sampled presentation, such as an
+    /// alternating run that settles at its origin or a custom easing endpoint.
     fn presents_authored_target(&self) -> bool {
         !self.is_active && self.progress == Progress::END
     }

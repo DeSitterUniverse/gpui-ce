@@ -88,8 +88,8 @@ impl<T: Lerp + Clone + PartialEq + 'static> Transition<T> {
 
     /// Sets the forward pass's easing function for this transition.
     ///
-    /// The easing function maps normalized local pass time to normalized
-    /// presentation progress. It may be non-monotonic within that range.
+    /// The easing function maps normalized local pass time to presentation
+    /// progress, which may be non-monotonic or overshoot zero through one.
     pub fn with_easing(mut self, easing: impl Fn(f32) -> f32 + 'static) -> Self {
         self.motion = self.motion.with_easing(easing);
         self.clear_cache();

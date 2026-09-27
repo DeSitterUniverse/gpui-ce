@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 mod example_prelude;
 
 use gpui::{
-    App, AppContext, Bounds, Context, FontWeight, Motion, MotionPass, Window, WindowBounds,
-    WindowOptions, div, ease_in_out, millis, prelude::*, px, relative, rgb, size,
+    App, AppContext, Bounds, Context, FontWeight, Motion, MotionPass, MotionSample, Window,
+    WindowBounds, WindowOptions, div, ease_in_out, millis, prelude::*, px, relative, rgb, size,
 };
 
 const BACKGROUND: u32 = 0x141a26;
@@ -107,6 +107,7 @@ struct Timeline {
     elapsed: Duration,
     last_tick: Option<Instant>,
     value: f32,
+    last_sample: Option<MotionSample>,
 }
 
 impl Timeline {
@@ -114,12 +115,14 @@ impl Timeline {
         self.elapsed = Duration::ZERO;
         self.last_tick = Some(now);
         self.value = 0.;
+        self.last_sample = None;
     }
 
     fn stop(&mut self) {
         self.elapsed = Duration::ZERO;
         self.last_tick = None;
         self.value = 0.;
+        self.last_sample = None;
     }
 
     fn is_active(&self) -> bool {
@@ -134,6 +137,7 @@ impl Timeline {
         self.elapsed += now.saturating_duration_since(last_tick);
         let sample = motion.sample(self.elapsed);
         self.value = sample.progress.get();
+        self.last_sample = Some(sample);
         self.last_tick = sample.is_active.then_some(now);
         sample.is_active
     }
@@ -142,6 +146,7 @@ impl Timeline {
         self.elapsed = elapsed;
         let sample = motion.sample(elapsed);
         self.value = sample.progress.get();
+        self.last_sample = Some(sample);
         self.last_tick = sample.is_active.then_some(now);
     }
 }
@@ -373,6 +378,20 @@ impl Render for MotionShowcase {
         let progress_value =
             self.progress_from + (self.progress_to - self.progress_from) * self.progress.value;
         let notification_value = self.notification.value;
+        let notification_sample = self.notification.last_sample.map_or_else(
+            || "Press Play to inspect the sample".to_string(),
+            |sample| {
+                format!(
+                    "Pass {} · {:?} · local {:.2} · {:?} · at end: {} · complete: {}",
+                    sample.iteration + 1,
+                    sample.direction,
+                    sample.local_time.get(),
+                    sample.phase,
+                    sample.is_at_end(),
+                    sample.is_complete(),
+                )
+            },
+        );
         let item_values: [f32; 3] = std::array::from_fn(|index| self.items[index].value);
         let attention_value = self.attention.value;
         let pulse_value = self.pulse.value;
@@ -637,6 +656,12 @@ impl Render for MotionShowcase {
                                 .bg(rgb(SURFACE))
                                 .child("NOTIFICATION"),
                         ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(notification_sample),
                 )
                 .child(notification_stepper)
                 .child(
