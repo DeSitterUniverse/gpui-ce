@@ -1502,7 +1502,7 @@ impl PlatformTextSystem for ParleyTextSystem {
     }
 
     fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
-        self.parley_paragraph_layout(ParleyLayoutParams {
+        self.parley_layout(ParleyLayoutParams {
             text: request,
             inline: None,
         })
@@ -2075,6 +2075,320 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_direction_does_not_leak_across_newlines() {
+        let system = test_system();
+        let text = "שלום עולם\nabc אבג def\nx (مرحبا) y";
+        let runs = [text_run(text, "IBM Plex Sans")];
+        let document = wrapped(layout_line(&system, text, px(18.0), &runs), px(500.0));
+
+        for (left, right) in [("abc", "def"), ("x", "y")] {
+            let left_position = document
+                .visual_position_for_byte_index(text.find(left).unwrap(), px(24.0))
+                .unwrap();
+            let right_position = document
+                .visual_position_for_byte_index(text.find(right).unwrap(), px(24.0))
+                .unwrap();
+
+            assert_eq!(left_position.y, right_position.y);
+            assert!(
+                left_position.x < right_position.x,
+                "{left} must precede {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_paint_and_carets_match_independent_layouts() {
+        let system = test_system();
+        let sample =
+            "שלום עולם\nمرحبا بالعالم\nabc אבג def\nx (مرحبا) y\nEnglish ثم عربي ثم English";
+
+        for text in [
+            sample.to_string(),
+            format!("Latin first\n{sample}\n\n"),
+            "אבג\u{2028}abc אבג def\n123 (45)\n\u{2067}אבג\u{2069} abc\nمرحبا".to_string(),
+        ] {
+            for width in [px(500.), px(90.)] {
+                let document = layout_wrapped(
+                    &system,
+                    &text,
+                    px(18.),
+                    &[text_run(&text, "IBM Plex Sans")],
+                    width,
+                    None,
+                );
+                assert_document_contract(&text, &document);
+
+                let mut first_line = 0;
+
+                for source in paragraph_ranges(&text) {
+                    let content = &text[source.content.clone()];
+                    let independent = layout_wrapped(
+                        &system,
+                        content,
+                        px(18.),
+                        &[text_run(content, "IBM Plex Sans")],
+                        width,
+                        None,
+                    );
+
+                    for (idx, expected) in independent.visual_lines.iter().enumerate() {
+                        let actual = &document.visual_lines[first_line + idx];
+                        assert_eq!(actual.advance_width, expected.advance_width);
+                        assert_eq!(
+                            document.paint_fragments[actual.fragment_range.clone()],
+                            independent.paint_fragments[expected.fragment_range.clone()],
+                            "{content:?} at {width:?}"
+                        );
+                    }
+
+                    for (idx, _character) in content
+                        .char_indices()
+                        .chain(std::iter::once((content.len(), '\0')))
+                    {
+                        for affinity in [CaretAffinity::Downstream, CaretAffinity::Upstream] {
+                            let local = CaretPosition {
+                                index: idx,
+                                affinity,
+                            };
+                            let global = CaretPosition {
+                                index: source.content.start + idx,
+                                affinity,
+                            };
+                            let mut expected = independent
+                                .platform_layout
+                                .caret_bounds(local, px(24.))
+                                .unwrap();
+                            expected.origin.y += px(24.) * first_line;
+
+                            assert_eq!(
+                                document.platform_layout.caret_bounds(global, px(24.)),
+                                Some(expected)
+                            );
+                        }
+                    }
+
+                    first_line += independent.visual_lines.len();
+                }
+
+                assert_eq!(first_line, document.visual_lines.len());
+                assert!(
+                    document
+                        .paint_fragments
+                        .iter()
+                        .flat_map(|fragment| &fragment.glyphs)
+                        .all(|glyph| glyph.id != GlyphId(0)),
+                    "fixtures must cover the sample"
+                );
+            }
+        }
+
+        let arabic = "مرحبا بالعالم";
+        let layout = layout_line(
+            &system,
+            arabic,
+            px(24.),
+            &[text_run(arabic, "Noto Sans Arabic")],
+        );
+        let fragment = &layout.paint_fragments[0];
+        let nominal = arabic
+            .chars()
+            .map(|character| system.glyph_for_char(fragment.font_id, character).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(
+            fragment
+                .glyphs
+                .iter()
+                .any(|glyph| !nominal.contains(&glyph.id)),
+            "Arabic must use contextual forms"
+        );
+    }
+
+    #[test]
+    fn paragraph_interaction_preserves_breaks_and_visual_traversal() {
+        let system = test_system();
+        let text = "שלום עולם\r\n\nabc אבג def\u{2029}مرحبا بالعالم\n";
+        let layout = layout_wrapped(
+            &system,
+            text,
+            px(18.),
+            &[text_run(text, "IBM Plex Sans")],
+            px(100.),
+            None,
+        );
+        let native = &layout.platform_layout;
+        let line_height = px(24.);
+        let geometry = |caret| native.caret_bounds(caret, line_height).unwrap();
+        let mut caret = native
+            .caret_from_pixel_point(point(px(-100.), px(12.)), line_height)
+            .unwrap_err();
+        let mut steps = 0;
+
+        while let Some(next) = native.adjacent_visual_caret(caret, VisualDirection::Right) {
+            let previous = native
+                .adjacent_visual_caret(next, VisualDirection::Left)
+                .unwrap();
+            assert_eq!(
+                geometry(previous),
+                geometry(caret),
+                "visual movement must be reversible"
+            );
+
+            let bounds = geometry(next);
+            let hit = native
+                .caret_from_pixel_point(
+                    point(bounds.origin.x, bounds.origin.y + line_height / 2.),
+                    line_height,
+                )
+                .unwrap_or_else(|caret| caret);
+            assert_eq!(geometry(hit), bounds);
+            assert!(text.is_char_boundary(next.index));
+            caret = next;
+            steps += 1;
+            assert!(steps < text.len() * 4);
+        }
+
+        assert!(steps > text.chars().count() / 2);
+
+        for source in paragraph_ranges(text) {
+            if source.separator.is_empty() {
+                continue;
+            }
+
+            let before = CaretPosition::attached_to_next_cluster(source.separator.start);
+            let after = CaretPosition::attached_to_next_cluster(source.separator.end);
+            assert_eq!(
+                native.logical_cluster_after(before),
+                Some(source.separator.clone())
+            );
+            assert_eq!(
+                native.logical_cluster_before(after),
+                Some(source.separator.clone())
+            );
+            assert!(
+                !native
+                    .selection_bounds(source.separator.clone(), line_height)
+                    .is_empty()
+            );
+            assert!(
+                native
+                    .inline_geometry(source.separator.clone())
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let position = geometry(before).origin + point(px(0.), line_height / 2.);
+            let selected = native.selection_from_pixel_point(
+                position,
+                line_height,
+                TextSelectionKind::HardLine,
+            );
+            assert_eq!(selected, source.content.start..source.separator.end);
+
+            for (movement, expected) in [
+                (
+                    Direction::Start.with_boundary(Boundary::HardLine),
+                    source.content.start,
+                ),
+                (
+                    Direction::End.with_boundary(Boundary::HardLine),
+                    source.content.end,
+                ),
+            ] {
+                assert_eq!(
+                    native.caret_movement(before, movement, None).result.index,
+                    expected
+                );
+            }
+        }
+
+        let crlf = text.find('\r').unwrap();
+        let inside = CaretPosition::attached_to_next_cluster(crlf + 1);
+        assert_eq!(native.normalized_caret(inside).index, crlf);
+
+        let start = CaretPosition::default();
+        let down = native.caret_movement(
+            start,
+            Direction::Down.with_boundary(Boundary::VisualLine),
+            None,
+        );
+        assert_eq!(
+            geometry(down.result).origin.y,
+            geometry(start).origin.y + line_height
+        );
+        assert_eq!(down.vertical_navigation_x, Some(geometry(start).origin.x));
+
+        let mut vertical_caret = start;
+        let mut vertical_navigation_x = None;
+
+        for line_index in 1..native.line_count() {
+            let moved = native.caret_movement(
+                vertical_caret,
+                Direction::Down.with_boundary(Boundary::VisualLine),
+                vertical_navigation_x,
+            );
+            vertical_caret = moved.result;
+            vertical_navigation_x = moved.vertical_navigation_x;
+
+            assert_eq!(geometry(vertical_caret).origin.y, line_height * line_index);
+            assert_eq!(vertical_navigation_x, Some(geometry(start).origin.x));
+        }
+
+        for line_index in (0..native.line_count() - 1).rev() {
+            let moved = native.caret_movement(
+                vertical_caret,
+                Direction::Up.with_boundary(Boundary::VisualLine),
+                vertical_navigation_x,
+            );
+            vertical_caret = moved.result;
+            vertical_navigation_x = moved.vertical_navigation_x;
+
+            assert_eq!(geometry(vertical_caret).origin.y, line_height * line_index);
+        }
+
+        for direction in [VisualDirection::Left, VisualDirection::Right] {
+            let movement = match direction {
+                VisualDirection::Left => Direction::Left.with_boundary(Boundary::Word),
+                VisualDirection::Right => Direction::Right.with_boundary(Boundary::Word),
+            };
+            let edge_x = match direction {
+                VisualDirection::Left => px(-100.),
+                VisualDirection::Right => px(10_000.),
+            };
+            let empty_row = native
+                .caret_from_pixel_point(point(edge_x, line_height * 1.5), line_height)
+                .unwrap_or_else(|caret| caret);
+            let word = native.caret_movement(empty_row, movement, None).result;
+            assert_ne!(geometry(word).origin.y, geometry(empty_row).origin.y);
+        }
+
+        let selected = native.selection_bounds(0..text.len(), line_height);
+        assert!(
+            selected
+                .windows(2)
+                .all(|pair| pair[0].origin.y <= pair[1].origin.y)
+        );
+
+        let mixed = "abc אבג\nאבג abc\n";
+        let layout = layout_line(&system, mixed, px(18.), &[text_run(mixed, "IBM Plex Sans")]);
+
+        for (line_index, source) in paragraph_ranges(mixed).into_iter().take(2).enumerate() {
+            let selection = layout
+                .platform_layout
+                .selection_bounds(source.separator, line_height);
+            let bounds = selection[0];
+            assert_eq!(bounds.origin.y, line_height * line_index);
+
+            if line_index == 0 {
+                assert!(bounds.origin.x >= layout.visual_lines[line_index].advance_width);
+            } else {
+                assert!(bounds.right() <= Pixels::ZERO);
+            }
+        }
+    }
+
+    #[test]
     fn paragraph_inline_layout_preserves_styles_empty_rows_and_boundary_boxes() {
         let system = test_system();
         let text = "אבג\r\nalpha مرحبا omega\r\n\r\n";
@@ -2194,6 +2508,44 @@ mod tests {
                 .unwrap();
             assert!(regions.iter().all(|geometry| geometry.bounds.origin.y
                 >= inline.lines[geometry.visual_line_index].origin.y));
+        }
+    }
+
+    #[test]
+    fn paragraph_composition_preserves_existing_latin_wrapping_and_clamping() {
+        let system = test_system();
+        let text = "one two three four\nfive six seven eight\nnine ten\n";
+        let runs = [text_run(text, "IBM Plex Sans")];
+
+        for max_lines in [None, Some(0), Some(1), Some(3), Some(8)] {
+            let document = layout_wrapped(&system, text, px(18.), &runs, px(80.), max_lines);
+            let previous = system
+                .parley_paragraph_layout(ParleyLayoutParams {
+                    text: TextLayoutRequest {
+                        text,
+                        font_size: px(18.),
+                        runs: &runs,
+                        wrap_width: Some(px(80.)),
+                        line_clamp: max_lines,
+                    },
+                    inline: None,
+                })
+                .unwrap();
+
+            assert_eq!(
+                document
+                    .visual_lines
+                    .iter()
+                    .map(|line| line.text_range.clone())
+                    .collect::<Vec<_>>(),
+                previous
+                    .layout
+                    .visual_lines
+                    .iter()
+                    .map(|line| line.text_range.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_document_contract(text, &document);
         }
     }
 

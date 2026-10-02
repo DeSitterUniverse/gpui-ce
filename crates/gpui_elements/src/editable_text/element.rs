@@ -815,7 +815,7 @@ impl PrepaintElements {
         if prepaint.caret_visible {
             let caret_point = document_origin
                 + document
-                    .visual_position_for_caret(state.caret_selection().caret, line_height)
+                    .visual_position_for_caret(state.visible_caret(), line_height)
                     .unwrap_or_default();
             let caret_height = caret_height.to_pixels(line_height.into(), window.rem_size());
             let vertical_offset = (line_height - caret_height) / 2.;
@@ -837,14 +837,378 @@ mod tests {
     use super::*;
     use crate::editable_text::StringStorage;
     use gpui::{
-        AppContext as _, CaretPosition, CaretSelection, Context, HeadlessAppContext, Render,
-        ScaledPixels, TestTextSystem, div, hsla, prelude::*, rgba,
+        AppContext as _, CaretPosition, CaretSelection, Context, EntityInputHandler,
+        HeadlessAppContext, PlatformInput, PlatformTextSystem, Render, ScaledPixels,
+        TestTextSystem, WindowHandle, div, hsla, prelude::*, rgba,
     };
-    use std::{collections::HashSet, sync::Arc};
+    use gpui_parley::{ParleyTextSystem, SystemFonts};
+    use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
     const CONTAINER_COLOR: Hsla = hsla(0.72, 0.45, 0.32, 1.0);
     const INPUT_COLOR: Hsla = hsla(0.08, 0.55, 0.28, 1.0);
     const SELECTION_COLOR: Hsla = hsla(0.37, 0.65, 0.42, 1.0);
+    const CARET_COLOR: Hsla = hsla(0.95, 0.8, 0.6, 1.0);
+    const TEXT_COLOR: Hsla = hsla(0.0, 0.0, 0.1, 1.0);
+    const MARKED_COLOR: Hsla = hsla(0.55, 0.8, 0.6, 1.0);
+
+    struct BidiInputView {
+        input: Entity<EditableTextState>,
+        padding: Pixels,
+        width: Pixels,
+        wrap: bool,
+    }
+
+    impl Render for BidiInputView {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _context: &mut Context<Self>,
+        ) -> impl IntoElement {
+            div().p(px(24.)).child(
+                editable_text("bidi-input")
+                    .state(self.input.downgrade())
+                    .p(self.padding)
+                    .w(self.width)
+                    .h(px(120.))
+                    .border_1()
+                    .rounded_lg()
+                    .bg(INPUT_COLOR)
+                    .text_color(TEXT_COLOR)
+                    .selection_color(SELECTION_COLOR)
+                    .caret_color(CARET_COLOR)
+                    .marked_color(MARKED_COLOR)
+                    .text_size(px(20.))
+                    .line_height(px(if self.wrap { 27.5 } else { 28. }))
+                    .when(self.wrap, |input| {
+                        input.flex_col().whitespace_normal().overflow_y_scroll()
+                    })
+                    .when(!self.wrap, |input| {
+                        input.whitespace_nowrap().overflow_x_scroll()
+                    }),
+            )
+        }
+    }
+
+    struct BidiInputFixture {
+        input: Entity<EditableTextState>,
+        window: WindowHandle<BidiInputView>,
+        padding: Pixels,
+        scale: f32,
+        context: HeadlessAppContext,
+    }
+
+    impl BidiInputFixture {
+        fn new(text: &str, padding: f32, width: f32, wrap: bool, scale: f32) -> Self {
+            let system = ParleyTextSystem::new_with_system_font(SystemFonts::Skip, "IBM Plex Sans")
+                .with_fallback_families(["IBM Plex Sans", "Noto Sans Hebrew", "Noto Sans Arabic"]);
+            system
+                .add_fonts(vec![
+                    Cow::Borrowed(include_bytes!(
+                        "../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+                    )),
+                    Cow::Borrowed(include_bytes!(
+                        "../../../../assets/fonts/noto-sans-hebrew/NotoSansHebrew-Regular.ttf"
+                    )),
+                    Cow::Borrowed(include_bytes!(
+                        "../../../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf"
+                    )),
+                ])
+                .unwrap();
+
+            let mut context = HeadlessAppContext::new(Arc::new(system));
+            let input = context.update(|context| {
+                context.new(|context| EditableTextState::new(StringStorage::from(text), context))
+            });
+
+            let window = context
+                .open_window(size(px(500.), px(240.)), |window, context| {
+                    window.set_scale_factor(scale);
+
+                    context.new(|_context| BidiInputView {
+                        input: input.clone(),
+                        padding: px(padding),
+                        width: px(width),
+                        wrap,
+                    })
+                })
+                .unwrap();
+            context.run_until_parked();
+
+            Self {
+                input,
+                window,
+                padding: px(padding),
+                scale,
+                context,
+            }
+        }
+
+        fn origin(&mut self) -> Point<Pixels> {
+            let bounds = only_quad(&mut self.context, self.window.into(), INPUT_COLOR)
+                .map(|value| px(value.as_f32() / self.scale));
+            let scroll = self
+                .context
+                .update(|context| self.input.read(context).layout_data.scroll_bounds.origin);
+
+            bounds.origin + point(self.padding, self.padding) - scroll
+        }
+
+        fn document(&mut self) -> Arc<WrappedLine> {
+            self.context.update(|context| {
+                self.input
+                    .read(context)
+                    .layout_data
+                    .document
+                    .clone()
+                    .unwrap()
+            })
+        }
+
+        fn line_height(&mut self) -> Pixels {
+            self.context
+                .update(|context| self.input.read(context).layout_data.line_height)
+        }
+
+        fn scroll(&mut self, offset: Point<Pixels>) {
+            self.context.update(|context| {
+                self.input.update(context, |state, context| {
+                    state.layout_data.next_scroll_offset = Some(offset);
+                    context.notify();
+                })
+            });
+            self.context.run_until_parked();
+            self.context.update(|context| {
+                assert_eq!(
+                    self.input.read(context).layout_data.scroll_bounds.origin,
+                    offset
+                );
+            });
+        }
+
+        fn point(&mut self, idx: usize) -> Point<Pixels> {
+            let caret = CaretPosition::attached_to_next_cluster(idx);
+            let line_height = self.line_height();
+            let local = self
+                .document()
+                .visual_position_for_caret(caret, line_height)
+                .unwrap();
+
+            self.origin() + local + point(px(0.), line_height / 2.)
+        }
+
+        fn dispatch(&mut self, event: PlatformInput) {
+            self.context
+                .update_window(self.window.into(), |_view, window, context| {
+                    window.dispatch_event(event, context);
+                })
+                .unwrap();
+            self.context.run_until_parked();
+        }
+
+        fn down(&mut self, position: Point<Pixels>) {
+            self.dispatch(PlatformInput::MouseDown(MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }));
+        }
+
+        fn drag(&mut self, idx: usize) {
+            let position = self.point(idx);
+            self.dispatch(PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                ..Default::default()
+            }));
+        }
+
+        fn up(&mut self, idx: usize) {
+            let position = self.point(idx);
+            self.dispatch(PlatformInput::MouseUp(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }));
+        }
+
+        fn assert_selection(&mut self, anchor: usize, focus: usize) {
+            let range = anchor.min(focus)..anchor.max(focus);
+            let caret = self.context.update(|context| {
+                let state = self.input.read(context);
+                assert_eq!(state.selected_byte_range(), range);
+                assert_eq!(state.caret_selection().caret.index, focus);
+
+                state.caret_selection().caret
+            });
+
+            let origin = self.origin();
+            let document = self.document();
+            let line_height = self.line_height();
+            let caret_point = document
+                .visual_position_for_caret(caret, line_height)
+                .unwrap();
+            self.assert_quads(
+                CARET_COLOR,
+                vec![Bounds::new(origin + caret_point, size(px(2.), line_height))],
+            );
+
+            let expected = document
+                .selection_bounds(range, line_height)
+                .into_iter()
+                .map(|bounds| Bounds::new(origin + bounds.origin, bounds.size))
+                .collect();
+            self.assert_quads(SELECTION_COLOR, expected);
+        }
+
+        fn assert_quads(&mut self, color: Hsla, expected: Vec<Bounds<Pixels>>) {
+            let actual = self
+                .context
+                .solid_quad_bounds(self.window.into(), color)
+                .unwrap();
+            assert_eq!(actual.len(), expected.len(), "quad count for {color:?}");
+
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                let actual = actual.map(|value| px(value.as_f32() / self.scale));
+                assert!(
+                    (actual.origin - expected.origin).magnitude() <= 1.,
+                    "{actual:?} != {expected:?}"
+                );
+                assert!((actual.size.width - expected.size.width).abs() <= px(1.));
+                assert!((actual.size.height - expected.size.height).abs() <= px(1.));
+            }
+        }
+    }
+
+    #[test]
+    fn parley_input_clicks_and_drags_preserve_visual_carets() {
+        for (text, anchor, targets) in [
+            ("שלום עולם", 15, [13, 15, 17]),
+            (
+                "مرحبا بالعالم",
+                "مرحبا بالعا".len(),
+                [
+                    "مرحبا بالع".len(),
+                    "مرحبا بالعا".len(),
+                    "مرحبا بالعال".len(),
+                ],
+            ),
+            ("abc אבגד def", 8, [6, 8, 10]),
+            ("hello world", 3, [4, 3, 2]),
+        ] {
+            for (padding, scale) in [(0., 1.), (8., 1.), (8., 1.5)] {
+                let mut fixture = BidiInputFixture::new(text, padding, 320., false, scale);
+
+                for offset in [-0.25, 0., 0.25] {
+                    let position = fixture.point(anchor) + point(px(offset), px(0.));
+                    fixture.down(position);
+                    fixture.assert_selection(anchor, anchor);
+                    fixture.up(anchor);
+                }
+
+                let position = fixture.point(anchor);
+                fixture.down(position);
+
+                for target in targets {
+                    fixture.drag(target);
+                    fixture.assert_selection(anchor, target);
+                }
+
+                fixture.up(targets[2]);
+                fixture.drag(anchor);
+                fixture.assert_selection(anchor, targets[2]);
+            }
+        }
+    }
+
+    #[test]
+    fn parley_hebrew_click_uses_the_painted_gap() {
+        let mut fixture = BidiInputFixture::new("שלום עולם", 8., 320., false, 1.5);
+        let mut glyphs = fixture
+            .context
+            .glyph_bounds(fixture.window.into(), TEXT_COLOR)
+            .unwrap();
+        glyphs.sort_by(|left, right| left.origin.x.partial_cmp(&right.origin.x).unwrap());
+        assert_eq!(glyphs.len(), 8);
+
+        let gap =
+            px((glyphs[0].right().as_f32() + glyphs[1].left().as_f32()) / (2. * fixture.scale));
+        let position = point(gap, fixture.point(15).y);
+        fixture.down(position);
+        fixture.assert_selection(15, 15);
+        fixture.drag(13);
+        fixture.assert_selection(15, 13);
+    }
+
+    #[test]
+    fn parley_scrolled_input_keeps_selection_and_marked_text_under_the_glyphs() {
+        let text = "0123456789 שלום עולם 0123456789";
+        let anchor = "0123456789 שלום עול".len();
+        let focus = "0123456789 שלום עו".len();
+        let mut fixture = BidiInputFixture::new(text, 8., 200., false, 1.5);
+        fixture.scroll(point(px(45.), px(0.)));
+
+        let position = fixture.point(anchor);
+        fixture.down(position);
+        fixture.drag(focus);
+        fixture.assert_selection(anchor, focus);
+        fixture.up(focus);
+
+        let marked_start = text[..focus].encode_utf16().count();
+        fixture
+            .context
+            .update_window(fixture.window.into(), |_view, window, context| {
+                fixture.input.update(context, |state, context| {
+                    state.replace_and_mark_text_in_range(
+                        Some(marked_start..marked_start + 1),
+                        "ל",
+                        None,
+                        window,
+                        context,
+                    );
+                });
+            })
+            .unwrap();
+        fixture.context.run_until_parked();
+        fixture.scroll(point(px(45.), px(0.)));
+
+        let origin = fixture.origin();
+        let expected = fixture
+            .document()
+            .selection_bounds(focus..anchor, px(28.))
+            .into_iter()
+            .map(|bounds| {
+                Bounds::new(
+                    origin + bounds.origin + point(px(0.), px(26.)),
+                    size(bounds.size.width, px(2.)),
+                )
+            })
+            .collect();
+        fixture.assert_quads(MARKED_COLOR, expected);
+    }
+
+    #[test]
+    fn parley_wrapped_rtl_drag_preserves_the_anchor_across_rows() {
+        let mut fixture = BidiInputFixture::new("שלום עולם שלום עולם", 8., 120., true, 1.5);
+        assert!(fixture.document().line_count() > 1);
+
+        let anchor = 2;
+        let focus = "שלום עולם של".len();
+        let start = fixture.point(anchor);
+        assert!(fixture.point(focus).y > start.y);
+        fixture.down(start);
+        let position = fixture.point(focus) - point(px(0.), fixture.line_height() / 2. - px(0.05));
+        fixture.dispatch(PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: Some(MouseButton::Left),
+            ..Default::default()
+        }));
+        fixture.assert_selection(anchor, focus);
+        fixture.drag(0);
+        fixture.assert_selection(anchor, 0);
+        fixture.up(0);
+    }
 
     struct CenteredEditableTextView {
         extent: f32,
