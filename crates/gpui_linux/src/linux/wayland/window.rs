@@ -2089,10 +2089,6 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn supports_shader_paint(&self) -> bool {
-        true
-    }
-
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
 

@@ -544,10 +544,6 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        anyhow::ensure!(
-            scene.shaders.is_empty(),
-            "custom shader paint requires the WebGPU renderer; Direct3D 11 does not support it"
-        );
         self.pre_draw(&match background_appearance {
             appearance if appearance.is_opaque() => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -760,9 +756,6 @@ impl DirectXRenderer {
                     target: FilterRenderTarget::Inline,
                     ..
                 } => Ok(()),
-                RenderCommand::Batch(PrimitiveBatch::Shaders(_)) => {
-                    unreachable!("custom shader paints are rejected before Direct3D 11 encoding")
-                }
                 RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
                     unreachable!("filter boundaries are resolved by the render plan")
                 }

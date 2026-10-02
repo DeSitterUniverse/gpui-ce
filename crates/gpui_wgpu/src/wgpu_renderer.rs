@@ -20,7 +20,6 @@ mod filters;
 mod frame;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
-mod paint;
 mod path_types;
 mod pipelines;
 mod platform;
@@ -188,7 +187,6 @@ impl WgpuRenderer {
         let Some(resources) = self.resources.as_mut() else {
             return;
         };
-        resources.paints.invalidate();
         resources.pipelines = ShaderPipelines::new(
             &resources.device,
             &resources.bind_group_layouts,

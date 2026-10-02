@@ -98,24 +98,6 @@ impl PreparedTargets {
             renderer.ensure_filter_textures(requirements.isolated_target_count);
         }
         write_shader_globals(renderer);
-        let viewport = [
-            renderer.target.width() as f32,
-            renderer.target.height() as f32,
-        ];
-        let config = renderer.target.configuration().clone();
-        let resources = renderer.resources_mut();
-        if let Err(error) = resources.paints.prepare(
-            &resources.device,
-            &resources.queue,
-            &resources.bind_group_layouts.globals,
-            scene,
-            viewport,
-            config.format,
-            config.alpha_mode,
-        ) {
-            log::error!("paint preparation failed: {error}");
-            return None;
-        }
 
         if requirements.uses_offscreen_target {
             let resources = renderer.resources();
@@ -308,7 +290,6 @@ impl FrameRequirements {
                     reserve(std::mem::size_of::<PolychromeSprite>(), range.len())
                 }
                 PrimitiveBatch::Paths { .. }
-                | PrimitiveBatch::Shaders(_)
                 | PrimitiveBatch::Surfaces(_)
                 | PrimitiveBatch::BackdropFilters(_)
                 | PrimitiveBatch::FilterBoundary(_) => {}
@@ -598,11 +579,6 @@ fn encode_inline_batch(
     pass: &mut wgpu::RenderPass<'_>,
 ) -> DrawResult {
     match batch {
-        PrimitiveBatch::Shaders(range) => {
-            renderer.resources().paints.draw(scene, range.clone(), pass);
-            pass.set_bind_group(0, &renderer.resources().globals_bind_group, &[]);
-            Ok(())
-        }
         PrimitiveBatch::Quads { range, smoothed } => {
             renderer.draw_quads(&scene.quads[range.clone()], *smoothed, instances, pass)
         }
