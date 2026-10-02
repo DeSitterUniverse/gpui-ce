@@ -549,7 +549,7 @@ impl DirectXRenderer {
             "custom shader paint requires the WebGPU renderer; Direct3D 11 does not support it"
         );
         self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+            appearance if appearance.is_opaque() => [1.0f32; 4],
             _ => [0.0f32; 4],
         })?;
 
