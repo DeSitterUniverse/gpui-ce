@@ -502,7 +502,12 @@ impl GlyphRasterizer for SwashGlyphRasterizer {
         face: RasterFace<'_>,
         params: &RenderGlyphParams,
     ) -> Result<RasterizedGlyph> {
-        let Some(mut image) = self.render_glyph_image(&face, params)? else {
+        // Empty outlines, including spaces at fractional origins, may have one zero
+        // dimension. GPUI represents every empty raster with both dimensions zero.
+        let Some(mut image) = self
+            .render_glyph_image(&face, params)?
+            .filter(|image| image.placement.width != 0 && image.placement.height != 0)
+        else {
             let format = match params.raster_style.mode {
                 GlyphRenderMode::Subpixel => RasterizedGlyphFormat::BgraSubpixelMask,
                 GlyphRenderMode::Color => RasterizedGlyphFormat::BgraColor,

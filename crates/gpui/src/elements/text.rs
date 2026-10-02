@@ -905,6 +905,15 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
+
+        let runs: Arc<[TextRun]> = runs.into();
+        let content = crate::InlineContent::Text {
+            text: text.clone(),
+            runs: runs.clone(),
+            font_size,
+            line_height,
+        };
+
         let layout_id = window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
@@ -984,11 +993,17 @@ impl TextLayout {
                 size
             }
         });
+
+        window.publish_inline_content(layout_id, content);
         self.0.layout_id.set(Some(layout_id));
         layout_id
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &mut Window) {
+        if window.current_inline_fragments.is_some() {
+            return;
+        }
+
         let bounds = self
             .0
             .layout_id
@@ -1004,6 +1019,10 @@ impl TextLayout {
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
+        if window.current_inline_fragments.is_some() {
+            return;
+        }
+
         let element_state = self.0.layout.borrow();
         let element_state = element_state
             .as_ref()
@@ -1461,7 +1480,11 @@ impl Element for InteractiveText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        self.text.request_layout(None, inspector_id, window, cx)
+        let result = self.text.request_layout(None, inspector_id, window, cx);
+
+        // InteractiveText owns range-based selection and hit testing in its independent layout.
+        window.publish_inline_content(result.0, crate::InlineContent::Atomic);
+        result
     }
 
     fn prepaint(
@@ -1600,16 +1623,16 @@ impl Element for InteractiveText {
                         }
                     });
 
-                    // Use bounds instead of testing hitbox since this is called during prepaint.
+                    // Check hitbox geometry directly because hover state is unavailable during prepaint.
                     let check_is_hovered_during_prepaint = Rc::new({
-                        let source_bounds = hitbox.bounds;
+                        let source_hitbox = hitbox.clone();
                         let text_layout = text_layout.clone();
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
                             text_layout
                                 .index_for_position(window.mouse_position())
                                 .is_ok()
-                                && source_bounds.contains(&window.mouse_position())
+                                && source_hitbox.contains(&window.mouse_position())
                                 && pending_mouse_down.get().is_none()
                         }
                     });

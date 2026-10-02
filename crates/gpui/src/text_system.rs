@@ -1,6 +1,12 @@
+#[cfg(test)]
+use crate::{AtlasKey, AtlasTextureKind, TestTextSystem, hsla, point, size};
+
+#[cfg(test)]
+use std::{sync::atomic::AtomicUsize, sync::atomic::Ordering};
+
 use crate::{
     Bounds, DevicePixels, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
+    StrikethroughStyle, TextAlign, TextRenderingMode, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
 use collections::FxHashMap;
@@ -357,6 +363,11 @@ impl WindowTextSystem {
         Ok(WrappedLine { layout, text })
     }
 
+    /// Layout text and atomic element boxes in one inline formatting context.
+    pub fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
+        self.text_system.platform_text_system.layout_inline(request)
+    }
+
     /// Layout the given line of text, at the given font_size.
     /// Subsets of the line can be styled independently with the `runs` parameter.
     /// Generally, you should prefer to use [`Self::shape_line`] instead, which
@@ -505,6 +516,55 @@ pub struct TextLayoutRequest<'a> {
     pub wrap_width: Option<Pixels>,
     /// Optional maximum number of visual rows.
     pub line_clamp: Option<usize>,
+}
+
+/// An atomic element inserted at a UTF-8 boundary in an inline document.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InlineBoxRequest {
+    /// Identifier returned with the positioned box.
+    pub id: u64,
+    /// UTF-8 byte index at which to insert the box.
+    pub index: usize,
+    /// Measured size of the element.
+    pub size: Size<Pixels>,
+    /// Vertical alignment within the line containing this element.
+    pub vertical_align: crate::VerticalAlign,
+}
+
+/// Resolved font size and line height for part of an inline document.
+#[derive(Clone, Debug)]
+pub struct InlineTextStyle {
+    /// UTF-8 range receiving these resolved metrics.
+    pub range: Range<usize>,
+    /// Font size for this range.
+    pub font_size: Pixels,
+    /// Absolute line height for this range.
+    pub line_height: Pixels,
+}
+
+/// Complete input for a document containing text and element boxes.
+#[derive(Clone, Copy, Debug)]
+pub struct InlineLayoutRequest<'a> {
+    /// UTF-8 source text.
+    pub text: &'a str,
+    /// Complete shaping and paint styles covering `text`.
+    pub runs: &'a [TextRun],
+    /// Resolved font sizes and line heights within the document.
+    pub text_styles: &'a [InlineTextStyle],
+    /// Atomic boxes inserted into the text.
+    pub boxes: &'a [InlineBoxRequest],
+    /// Base font size.
+    pub font_size: Pixels,
+    /// Requested height of an ordinary text row.
+    pub line_height: Pixels,
+    /// Metrics for the inline container's base font.
+    pub text_metrics: InlineTextMetrics,
+    /// Optional soft-wrap width.
+    pub wrap_width: Option<Pixels>,
+    /// Optional maximum number of visual rows.
+    pub line_clamp: Option<usize>,
+    /// Horizontal alignment within `wrap_width`.
+    pub text_align: TextAlign,
 }
 
 impl Eq for TextRun {}
@@ -952,11 +1012,6 @@ mod text_range_tests {
 #[cfg(test)]
 mod raster_contract_tests {
     use super::*;
-    use crate::{
-        AtlasKey, AtlasTextureKind, LineLayout, RasterColorEffect, RasterStyleRequest,
-        TestTextSystem, TextLayoutRequest, hsla, point, size,
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn params(style: PreparedRasterStyle) -> RenderGlyphParams {
         RenderGlyphParams {
@@ -1200,8 +1255,8 @@ mod raster_contract_tests {
             PlatformTextSystem::advance(&TestTextSystem, font_id, glyph_id)
         }
 
-        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
-            PlatformTextSystem::glyph_for_char(&TestTextSystem, font_id, ch)
+        fn glyph_for_char(&self, font_id: FontId, character: char) -> Option<GlyphId> {
+            PlatformTextSystem::glyph_for_char(&TestTextSystem, font_id, character)
         }
 
         fn rasterize_glyph(&self, _params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
@@ -1251,6 +1306,10 @@ mod raster_contract_tests {
 
         fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
             PlatformTextSystem::layout_text(&TestTextSystem, request)
+        }
+
+        fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
+            PlatformTextSystem::layout_inline(&TestTextSystem, request)
         }
     }
 }

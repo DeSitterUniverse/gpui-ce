@@ -5,30 +5,72 @@ use crate::{
 use anyhow::{Context as _, Result};
 use gpui::{
     Bounds, CaretAffinity, CaretMovement, CaretPosition, Font, FontId, FontMetrics, GlyphId,
-    LineLayout, PaintFragment, PaintStyle, Pixels, PlatformTextLayout, PlatformTextSystem,
-    PreparedRasterStyle, RasterStyleRequest, RasterizedGlyph, RenderGlyphParams, ShapedGlyph, Size,
+    InlineBoxRequest, InlineLayout, InlineLayoutRequest, InlineRangeGeometry, InlineTextMetrics,
+    InlineTextStyle, InlineVisualLine, LineLayout, PaintFragment, PaintStyle, Pixels,
+    PlatformTextLayout, PlatformTextSystem, PositionedInlineBox, PreparedRasterStyle,
+    RasterStyleRequest, RasterizedGlyph, RenderGlyphParams, ShapedGlyph, Size, TextAlign,
     TextBoundary as Boundary, TextDirection as Direction, TextLayoutRequest, TextMovement,
-    TextRenderingMode, TextRun, TextSelectionKind, VisualDirection, VisualLine, point, px, size,
+    TextRenderingMode, TextRun, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes,
+    is_paragraph_separator, point, px, size,
 };
 use parking_lot::{Mutex, RwLock};
 use parley::setting::Tag;
 use parley::{
-    Affinity, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor, FontContext, FontFamily,
-    FontFamilyName, FontFeature, FontFeatures, FontStyle, FontWeight, GenericFamily, Layout,
-    LayoutContext, PositionedLayoutItem, Selection, StyleProperty,
+    Affinity, Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor,
+    FontContext, FontFamily, FontFamilyName, FontFeature, FontFeatures, FontStyle, FontWeight,
+    GenericFamily, InlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight,
+    PositionedLayoutItem, Selection, StyleProperty,
 };
 use skrifa::instance::NormalizedCoord;
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Range};
 use unicode_segmentation::UnicodeSegmentation as _;
+
+mod paragraphs;
+
+use paragraphs::{ParagraphLayout, ParleyDocumentLayout, local_range, paragraph_ranges};
 
 struct ParleyState {
     fonts: FontContext,
     layout: LayoutContext<PaintStyle>,
 }
 
+struct ParleyLayoutParams<'a> {
+    text: TextLayoutRequest<'a>,
+    inline: Option<ParleyInlineLayoutParams<'a>>,
+}
+
+struct ParleyInlineLayoutParams<'a> {
+    boxes: &'a [InlineBoxRequest],
+    text_styles: &'a [InlineTextStyle],
+    line_height: Pixels,
+    text_metrics: InlineTextMetrics,
+    text_align: TextAlign,
+}
+
+struct ParleyLayoutResult {
+    layout: LineLayout,
+    inline_lines: Vec<InlineVisualLine>,
+    inline_boxes: Vec<PositionedInlineBox>,
+    size: Size<Pixels>,
+    is_rtl: bool,
+}
+
+fn inline_alignment_offset(text_align: TextAlign, lines: &[InlineVisualLine]) -> Pixels {
+    let Some(line) = lines.first() else {
+        return Pixels::ZERO;
+    };
+
+    match text_align {
+        TextAlign::Left => Pixels::ZERO,
+        TextAlign::Center => line.origin.x + line.size.width / 2.,
+        TextAlign::Right => line.origin.x + line.size.width,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ParleyLayout {
     layout: Layout<PaintStyle>,
+    inline_lines: Vec<InlineVisualLine>,
     text_len: usize,
     caret_stops: Vec<ParleyCaretStop>,
     graphemes: Vec<std::ops::Range<usize>>,
@@ -64,7 +106,7 @@ impl IntoAffinity<CaretAffinity> for Affinity {
 }
 
 impl ParleyLayout {
-    fn new(layout: Layout<PaintStyle>, text: &str) -> Self {
+    fn new(layout: Layout<PaintStyle>, text: &str, inline_lines: Vec<InlineVisualLine>) -> Self {
         let graphemes = text
             .grapheme_indices(true)
             .map(|(start, grapheme)| start..start + grapheme.len())
@@ -72,6 +114,7 @@ impl ParleyLayout {
         let caret_stops = Self::collect_caret_stops(&layout, text, &graphemes);
         Self {
             layout,
+            inline_lines,
             text_len: text.len(),
             caret_stops,
             graphemes,
@@ -222,7 +265,13 @@ impl PlatformTextLayout for ParleyLayout {
     }
 
     fn size(&self) -> Size<Pixels> {
-        size(px(self.layout.width()), px(self.layout.height()))
+        let width = if self.text_len == 0 && self.layout.inline_boxes().is_empty() {
+            Pixels::ZERO
+        } else {
+            px(self.layout.width())
+        };
+
+        size(width, px(self.layout.height()))
     }
 
     fn byte_index_from_pixel_point(
@@ -234,7 +283,7 @@ impl PlatformTextLayout for ParleyLayout {
             .caret_from_pixel_point(pixel_point, line_height)
             .unwrap_or_else(|caret| caret)
             .index;
-        if pixel_point.y < Pixels::ZERO || line_height <= Pixels::ZERO {
+        if self.text_len == 0 || pixel_point.y < Pixels::ZERO || line_height <= Pixels::ZERO {
             return Err(closest);
         }
         let line_index = (pixel_point.y / line_height) as usize;
@@ -274,6 +323,10 @@ impl PlatformTextLayout for ParleyLayout {
             pixel_point.x.into(),
             self.native_y_for_line(line_index),
         ));
+        if self.text_len == 0 {
+            return Err(caret);
+        }
+
         let Some(line) = self.layout.get(line_index) else {
             return Err(caret);
         };
@@ -295,6 +348,13 @@ impl PlatformTextLayout for ParleyLayout {
     fn caret_bounds(&self, caret: CaretPosition, line_height: Pixels) -> Option<Bounds<Pixels>> {
         if caret.index > self.len() {
             return None;
+        }
+
+        if self.text_len == 0 && self.layout.inline_boxes().is_empty() {
+            return Some(Bounds::new(
+                point(self.inline_lines[0].origin.x, Pixels::ZERO),
+                size(Pixels::ZERO, line_height),
+            ));
         }
 
         let cursor = self.cursor(caret);
@@ -323,6 +383,10 @@ impl PlatformTextLayout for ParleyLayout {
         caret: CaretPosition,
         direction: VisualDirection,
     ) -> Option<CaretPosition> {
+        if self.text_len == 0 && self.layout.inline_boxes().is_empty() {
+            return None;
+        }
+
         let cursor = self.cursor(caret);
         let adjacent = self.adjacent_caret_stop(cursor, direction)?;
         let moved = self.direct_visual_move(cursor, direction);
@@ -330,6 +394,7 @@ impl PlatformTextLayout for ParleyLayout {
         let inverse = self.direct_visual_move(moved, Self::opposite(direction));
         let inverse_position = Self::cursor_position(&self.layout, inverse);
         let current_position = Self::cursor_position(&self.layout, cursor);
+
         let result = if moved_position == (adjacent.block, adjacent.inline)
             && inverse_position == current_position
         {
@@ -337,6 +402,7 @@ impl PlatformTextLayout for ParleyLayout {
         } else {
             adjacent.cursor
         };
+
         Some(Self::caret_position(result))
     }
 
@@ -357,6 +423,48 @@ impl PlatformTextLayout for ParleyLayout {
                 )
             })
             .collect()
+    }
+
+    fn inline_geometry(&self, range: std::ops::Range<usize>) -> Option<Vec<InlineRangeGeometry>> {
+        if range.is_empty() {
+            return None;
+        }
+
+        let cursor_at = |index, affinity| Cursor::from_byte_index(&self.layout, index, affinity);
+        let selection = Selection::new(
+            cursor_at(range.start, Affinity::Downstream),
+            cursor_at(range.end, Affinity::Upstream),
+        );
+        let mut regions = Vec::new();
+
+        selection.geometry_with(&self.layout, |selection_bounds, line_index| {
+            let Some(line) = self.layout.get(line_index) else {
+                return;
+            };
+
+            let metrics = line.metrics();
+
+            // Parley adds a selection-only extension after explicit newlines.
+            let clamped_right = (selection_bounds.x1 as f32)
+                .min(metrics.inline_min_coord + metrics.offset + metrics.advance);
+
+            if clamped_right > selection_bounds.x0 as f32 {
+                // Inline boxes and styled leading can change the row after Parley positions it.
+                let inline_line = self.inline_lines[line_index];
+                regions.push(InlineRangeGeometry {
+                    bounds: Bounds::from_corners(
+                        point(px(selection_bounds.x0 as f32), inline_line.origin.y),
+                        point(
+                            px(clamped_right),
+                            inline_line.origin.y + inline_line.size.height,
+                        ),
+                    ),
+                    visual_line_index: line_index,
+                });
+            }
+        });
+
+        Some(regions)
     }
 
     fn logical_cluster_before(&self, caret: CaretPosition) -> Option<std::ops::Range<usize>> {
@@ -444,6 +552,7 @@ impl PlatformTextLayout for ParleyLayout {
                         vertical_navigation_x,
                     };
                 };
+
                 let x = vertical_navigation_x
                     .map_or_else(|| cursor.geometry(&self.layout, 0.0).x0 as f32, f32::from);
                 let moved = Cursor::from_point(&self.layout, x, self.native_y_for_line(target_ix));
@@ -609,37 +718,227 @@ impl ParleyTextSystem {
         Ok(font_id)
     }
 
-    fn parley_layout(
-        &self,
-        text: &str,
-        font_size: Pixels,
-        runs: &[TextRun],
-        wrap: Option<(Pixels, Option<usize>)>,
-    ) -> Result<LineLayout> {
-        let mut expected_start = 0usize;
-        let mut run_ranges = Vec::with_capacity(runs.len());
-        for run in runs {
-            let Some(end) = expected_start.checked_add(run.len) else {
-                anyhow::bail!("text run length overflowed the input range");
+    fn parley_layout(&self, params: ParleyLayoutParams<'_>) -> Result<ParleyLayoutResult> {
+        let TextLayoutRequest {
+            text,
+            font_size,
+            runs,
+            line_clamp,
+            ..
+        } = params.text;
+        let (inline_boxes, text_styles) =
+            params.inline.as_ref().map_or((&[][..], &[][..]), |inline| {
+                (inline.boxes, inline.text_styles)
+            });
+
+        // Parley 0.11 resolves one base direction per layout, including across newlines.
+        if !text.chars().any(is_paragraph_separator) {
+            return self.parley_paragraph_layout(params);
+        }
+
+        let run_ranges = run_ranges(runs);
+
+        let mut paragraphs = Vec::new();
+        let mut visual_lines = Vec::new();
+        let mut paint_fragments = Vec::new();
+        let mut inline_lines = Vec::new();
+        let mut positioned_inline_boxes = Vec::new();
+
+        let mut document_size = Size::<Pixels>::default();
+        let mut width = Pixels::ZERO;
+        let mut ascent = Pixels::ZERO;
+        let mut descent = Pixels::ZERO;
+
+        for source in paragraph_ranges(text) {
+            let first_run = run_ranges.partition_point(|range| range.end <= source.content.start);
+            let mut paragraph_runs = run_ranges
+                .iter()
+                .enumerate()
+                .skip(first_run)
+                .take_while(|(_idx, range)| range.start < source.content.end)
+                .filter_map(|(idx, range)| {
+                    let local = local_range(range, &source.content)?;
+
+                    Some(TextRun {
+                        len: local.len(),
+                        ..runs[idx].clone()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut paragraph_styles = text_styles
+                .iter()
+                .filter_map(|style| {
+                    let range = local_range(&style.range, &source.content)?;
+
+                    Some(InlineTextStyle {
+                        range,
+                        ..style.clone()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            if source.content.is_empty() {
+                if let Some(run) = runs.get(first_run.min(runs.len().saturating_sub(1))) {
+                    paragraph_runs.push(TextRun {
+                        len: 0,
+                        ..run.clone()
+                    });
+                }
+
+                let style_idx = source.content.start.min(text.len().saturating_sub(1));
+                paragraph_styles.extend(
+                    text_styles
+                        .iter()
+                        .filter(|style| style.range.contains(&style_idx))
+                        .map(|style| InlineTextStyle {
+                            range: 0..0,
+                            ..style.clone()
+                        }),
+                );
+            }
+
+            let paragraph_boxes = inline_boxes
+                .iter()
+                .filter(|inline_box| {
+                    inline_box.index >= source.content.start
+                        && (inline_box.index < source.separator.end
+                            || source.separator.is_empty() && inline_box.index == text.len())
+                })
+                .map(|inline_box| InlineBoxRequest {
+                    index: inline_box.index.min(source.content.end) - source.content.start,
+                    ..*inline_box
+                })
+                .collect::<Vec<_>>();
+            let mut result = self.parley_paragraph_layout(ParleyLayoutParams {
+                text: TextLayoutRequest {
+                    text: &text[source.content.clone()],
+                    runs: &paragraph_runs,
+                    // Clamping stops soft wrapping after the budget, but preserves hard breaks.
+                    line_clamp: line_clamp.map(|count| count.saturating_sub(visual_lines.len())),
+                    ..params.text
+                },
+                inline: params
+                    .inline
+                    .as_ref()
+                    .map(|inline| ParleyInlineLayoutParams {
+                        boxes: &paragraph_boxes,
+                        text_styles: &paragraph_styles,
+                        ..*inline
+                    }),
+            })?;
+
+            let first_line = visual_lines.len();
+            let first_fragment = paint_fragments.len();
+            let block_offset = document_size.height;
+
+            for line in &mut result.layout.visual_lines {
+                line.text_range.start += source.content.start;
+                line.text_range.end += source.content.start;
+                line.fragment_range.start += first_fragment;
+                line.fragment_range.end += first_fragment;
+            }
+
+            if let Some(line) = result.layout.visual_lines.last_mut() {
+                // Keep separators in document indices without adding native trailing rows.
+                line.text_range.end = source.separator.end;
+            }
+
+            for line in &mut result.inline_lines {
+                line.origin.y += block_offset;
+            }
+
+            for inline_box in &mut result.inline_boxes {
+                inline_box.line_index += first_line;
+                inline_box.bounds.origin.y += block_offset;
+            }
+
+            width = width.max(result.layout.width);
+            ascent = ascent.max(result.layout.ascent);
+            descent = descent.max(result.layout.descent);
+            document_size.width = document_size.width.max(result.size.width);
+            document_size.height += result.size.height;
+
+            let last_line = result.inline_lines.last().unwrap();
+            let newline_width = (result.layout.ascent + result.layout.descent) * 0.25;
+            let newline = if result.is_rtl {
+                last_line.origin.x - newline_width..last_line.origin.x
+            } else {
+                let newline_x = last_line.origin.x + last_line.size.width;
+
+                newline_x..newline_x + newline_width
             };
 
-            if end > text.len() {
-                anyhow::bail!("text runs extend past the input text");
-            }
-
-            let range = expected_start..end;
-
-            if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
-                anyhow::bail!("text runs do not align with the input text");
-            }
-
-            expected_start = range.end;
-            run_ranges.push(range);
+            paragraphs.push(ParagraphLayout {
+                source,
+                first_line,
+                block_offset,
+                native: result.layout.platform_layout,
+                newline,
+                is_rtl: result.is_rtl,
+            });
+            visual_lines.extend(result.layout.visual_lines);
+            paint_fragments.extend(result.layout.paint_fragments);
+            inline_lines.extend(result.inline_lines);
+            positioned_inline_boxes.extend(result.inline_boxes);
         }
 
-        if expected_start != text.len() {
-            anyhow::bail!("text runs do not cover the input text");
-        }
+        let is_rtl = paragraphs[0].is_rtl;
+        let platform_layout = ParleyDocumentLayout::new(paragraphs, text, document_size);
+
+        Ok(ParleyLayoutResult {
+            layout: LineLayout {
+                font_size,
+                width,
+                ascent,
+                descent,
+                visual_lines: visual_lines.into_iter().collect(),
+                paint_fragments,
+                len: text.len(),
+                platform_layout: std::sync::Arc::new(platform_layout),
+            },
+            inline_lines,
+            inline_boxes: positioned_inline_boxes,
+            size: document_size,
+            is_rtl,
+        })
+    }
+
+    fn parley_paragraph_layout(
+        &self,
+        params: ParleyLayoutParams<'_>,
+    ) -> Result<ParleyLayoutResult> {
+        let TextLayoutRequest {
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+        } = params.text;
+
+        let wrap = (wrap_width.is_some() || line_clamp.is_some())
+            .then_some((wrap_width.unwrap_or(Pixels::MAX), line_clamp));
+
+        let (inline_boxes, text_styles, line_height, inline_text_metrics, text_align) =
+            match params.inline.as_ref() {
+                Some(inline) => (
+                    inline.boxes,
+                    inline.text_styles,
+                    Some(inline.line_height),
+                    Some(inline.text_metrics),
+                    Some(inline.text_align),
+                ),
+                None => (&[][..], &[][..], None, None, None),
+            };
+
+        let run_ranges = run_ranges(runs);
+        let line_height = if text.is_empty() {
+            text_styles
+                .last()
+                .map(|style| style.line_height)
+                .or(line_height)
+        } else {
+            line_height
+        };
 
         let family_lists = runs
             .iter()
@@ -692,18 +991,33 @@ impl ParleyTextSystem {
         let mut builder = layout.ranged_builder(fonts, text, 1.0, false);
         builder.set_line_break_override(Some(CHROMIUM_LINE_BREAK_OVERRIDE));
         builder.push_default(StyleProperty::FontSize(f32::from(font_size)));
+
+        if let Some(line_height) = line_height {
+            builder.push_default(StyleProperty::LineHeight(LineHeight::Absolute(f32::from(
+                line_height,
+            ))));
+        }
+
+        let mut push_style = |property, range| {
+            if text.is_empty() {
+                builder.push_default(property);
+            } else {
+                builder.push(property, range);
+            }
+        };
+
         for (run_index, run) in runs.iter().enumerate() {
             let descriptor = &run.font;
             let range = run_ranges[run_index].clone();
-            builder.push(
+            push_style(
                 StyleProperty::FontFamily(FontFamily::from(family_lists[run_index].as_slice())),
                 range.clone(),
             );
-            builder.push(
+            push_style(
                 StyleProperty::FontWeight(FontWeight::new(descriptor.weight.0)),
                 range.clone(),
             );
-            builder.push(
+            push_style(
                 StyleProperty::FontStyle(match descriptor.style {
                     gpui::FontStyle::Normal => FontStyle::Normal,
                     gpui::FontStyle::Italic => FontStyle::Italic,
@@ -713,7 +1027,7 @@ impl ParleyTextSystem {
             );
 
             if !feature_lists[run_index].is_empty() {
-                builder.push(
+                push_style(
                     StyleProperty::FontFeatures(FontFeatures::from(
                         feature_lists[run_index].as_slice(),
                     )),
@@ -722,38 +1036,64 @@ impl ParleyTextSystem {
             }
 
             if let Some(letter_spacing) = run.letter_spacing {
-                builder.push(
+                push_style(
                     StyleProperty::LetterSpacing(f32::from(letter_spacing)),
                     range.clone(),
                 );
             }
 
             let paint_style = PaintStyle::from(run);
-            builder.push(StyleProperty::Brush(paint_style.clone()), range.clone());
+            push_style(StyleProperty::Brush(paint_style.clone()), range.clone());
 
             if let Some(underline) = run.underline {
-                builder.push(StyleProperty::Underline(true), range.clone());
-                builder.push(
+                push_style(StyleProperty::Underline(true), range.clone());
+                push_style(
                     StyleProperty::UnderlineSize(Some(underline.thickness.into())),
                     range.clone(),
                 );
-                builder.push(
+                push_style(
                     StyleProperty::UnderlineBrush(Some(paint_style.clone())),
                     range.clone(),
                 );
             }
 
             if let Some(strikethrough) = run.strikethrough {
-                builder.push(StyleProperty::Strikethrough(true), range.clone());
-                builder.push(
+                push_style(StyleProperty::Strikethrough(true), range.clone());
+                push_style(
                     StyleProperty::StrikethroughSize(Some(strikethrough.thickness.into())),
                     range.clone(),
                 );
-                builder.push(
+                push_style(
                     StyleProperty::StrikethroughBrush(Some(paint_style)),
                     range.clone(),
                 );
             }
+        }
+
+        for style in text_styles {
+            push_style(
+                StyleProperty::FontSize(f32::from(style.font_size)),
+                style.range.clone(),
+            );
+
+            push_style(
+                StyleProperty::LineHeight(LineHeight::Absolute(f32::from(style.line_height))),
+                style.range.clone(),
+            );
+        }
+
+        for inline_box in inline_boxes {
+            if inline_box.index > text.len() || !text.is_char_boundary(inline_box.index) {
+                anyhow::bail!("inline box index does not align with the input text");
+            }
+
+            builder.push_inline_box(InlineBox {
+                id: inline_box.id,
+                kind: InlineBoxKind::InFlow,
+                index: inline_box.index,
+                width: f32::from(inline_box.size.width),
+                height: f32::from(inline_box.size.height),
+            });
         }
 
         let mut layout = builder.build(text);
@@ -779,21 +1119,85 @@ impl ParleyTextSystem {
         } else {
             layout.break_all_lines(None);
         }
+
+        // Parley uses an unbounded line width for empty layouts. Align their empty
+        // row here so centered and right-aligned carets stay inside the container.
+        let empty_alignment = (text.is_empty() && inline_boxes.is_empty()).then(|| {
+            let width = wrap
+                .map(|(width, _max_lines)| width)
+                .filter(|width| *width < Pixels::MAX)
+                .unwrap_or_default();
+
+            match text_align {
+                Some(TextAlign::Right) => width,
+                Some(TextAlign::Center) => width / 2.,
+                _ => Pixels::ZERO,
+            }
+        });
+
+        if let Some(text_align) = text_align
+            && empty_alignment.is_none()
+        {
+            let alignment = match text_align {
+                TextAlign::Left => Alignment::Left,
+                TextAlign::Center => Alignment::Center,
+                TextAlign::Right => Alignment::Right,
+            };
+
+            layout.align(alignment, AlignmentOptions::default());
+        }
+
         let mut visual_lines = Vec::new();
         let mut paint_fragments = Vec::new();
+
+        let mut positioned_inline_boxes = Vec::new();
+        let mut inline_lines = Vec::new();
+        let mut inline_line_metrics = Vec::new();
+        let mut inline_text_bounds = Vec::new();
+
         let mut width = px(0.0);
         let mut ascent = px(0.0);
         let mut descent = px(0.0);
 
         let mut saw_line = false;
-        for line in layout.lines() {
+
+        for (line_index, line) in layout.lines().enumerate() {
             saw_line = true;
 
             let fragment_start = paint_fragments.len();
             let metrics = *line.metrics();
-            let line_x = px(metrics.inline_min_coord + metrics.offset);
+            let line_x =
+                empty_alignment.unwrap_or_else(|| px(metrics.inline_min_coord + metrics.offset));
+            let line_advance = if empty_alignment.is_some() {
+                Pixels::ZERO
+            } else {
+                px(metrics.advance)
+            };
+
+            let mut text_metrics = inline_text_metrics.unwrap_or_default();
+            let leading =
+                ((line_height.unwrap_or_default() - text_metrics.ascent - text_metrics.descent)
+                    / 2.)
+                    .max(Pixels::ZERO);
+
+            let mut text_top = -text_metrics.ascent - leading;
+            let mut text_bottom = text_metrics.descent + leading;
+
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    let PositionedLayoutItem::InlineBox(inline_box) = item else {
+                        unreachable!();
+                    };
+
+                    positioned_inline_boxes.push(PositionedInlineBox {
+                        id: inline_box.id,
+                        line_index,
+                        bounds: Bounds::new(
+                            point(px(inline_box.x), px(inline_box.y)),
+                            size(px(inline_box.width), px(inline_box.height)),
+                        ),
+                    });
+
                     continue;
                 };
 
@@ -813,6 +1217,34 @@ impl ParleyTextSystem {
 
                 let baseline = glyph_run.baseline();
                 let run_metrics = glyph_run.run().metrics();
+
+                // Resolve leading from the input ranges. Parley 0.11 can report the
+                // following style's line height in a shaped run's cached metrics.
+                let range = run.text_range();
+
+                let run_line_height = text_styles
+                    .iter()
+                    .filter(|style| style.range.start < range.end && style.range.end > range.start)
+                    .map(|style| f32::from(style.line_height))
+                    .reduce(f32::max)
+                    .unwrap_or_else(|| {
+                        line_height
+                            .map(f32::from)
+                            .unwrap_or(run_metrics.line_height)
+                    });
+
+                let half_leading =
+                    ((run_line_height - run_metrics.ascent - run_metrics.descent) / 2.).max(0.);
+
+                text_metrics.ascent = text_metrics.ascent.max(px(run_metrics.ascent));
+                text_metrics.descent = text_metrics.descent.max(px(run_metrics.descent));
+                text_top = text_top.min(px(-run_metrics.ascent - half_leading));
+                text_bottom = text_bottom.max(px(run_metrics.descent + half_leading));
+
+                if text.is_empty() {
+                    continue;
+                }
+
                 let parley_style = glyph_run.style();
                 let mut paint_style = parley_style.brush.clone();
                 let underline_offset = parley_style.underline.as_ref().map(|decoration| {
@@ -857,6 +1289,7 @@ impl ParleyTextSystem {
                 let start = px(glyph_run.offset()) - line_x;
                 paint_fragments.push(PaintFragment {
                     font_id,
+                    font_size: px(run.font_size()),
                     glyphs,
                     x_range: start..start + px(glyph_run.advance()),
                     style: paint_style,
@@ -872,9 +1305,22 @@ impl ParleyTextSystem {
             visual_lines.push(VisualLine {
                 text_range,
                 fragment_range: fragment_start..paint_fragments.len(),
-                advance_width: px(metrics.advance),
+                advance_width: line_advance,
             });
-            width = width.max(px(metrics.advance));
+
+            inline_lines.push(InlineVisualLine {
+                origin: point(line_x, px(metrics.block_min_coord)),
+                size: size(
+                    line_advance,
+                    px(metrics.block_max_coord - metrics.block_min_coord),
+                ),
+                baseline: px(metrics.baseline - metrics.block_min_coord),
+            });
+
+            inline_line_metrics.push(text_metrics);
+            inline_text_bounds.push((text_top, text_bottom));
+
+            width = width.max(line_advance);
             ascent = ascent.max(px(metrics.ascent));
             descent = descent.max(px(metrics.descent));
         }
@@ -883,8 +1329,28 @@ impl ParleyTextSystem {
             anyhow::bail!("Parley produced no line");
         }
 
-        let platform_layout = ParleyLayout::new(layout.clone(), text);
-        Ok(LineLayout {
+        let mut size = size(px(layout.width()), px(layout.height()));
+
+        if empty_alignment.is_some() {
+            size.width = Pixels::ZERO;
+        }
+
+        if let (Some(text_metrics), Some(line_height)) = (inline_text_metrics, line_height) {
+            align_inline_boxes(
+                &mut inline_lines,
+                &mut positioned_inline_boxes,
+                &mut size,
+                inline_boxes,
+                &inline_line_metrics,
+                &inline_text_bounds,
+                text_metrics,
+                line_height,
+            );
+        }
+
+        let is_rtl = layout.is_rtl();
+        let platform_layout = ParleyLayout::new(layout, text, inline_lines.clone());
+        let line_layout = LineLayout {
             font_size,
             width,
             ascent,
@@ -893,8 +1359,29 @@ impl ParleyTextSystem {
             paint_fragments,
             len: text.len(),
             platform_layout: std::sync::Arc::new(platform_layout),
+        };
+
+        Ok(ParleyLayoutResult {
+            layout: line_layout,
+            inline_lines,
+            inline_boxes: positioned_inline_boxes,
+            size,
+            is_rtl,
         })
     }
+}
+
+fn run_ranges(runs: &[TextRun]) -> Vec<Range<usize>> {
+    let mut start = 0;
+
+    runs.iter()
+        .map(|run| {
+            let range = start..start + run.len;
+            start = range.end;
+
+            range
+        })
+        .collect()
 }
 
 fn push_face_families<'a>(
@@ -1015,12 +1502,40 @@ impl PlatformTextSystem for ParleyTextSystem {
     }
 
     fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
-        let wrap = (request.wrap_width.is_some() || request.line_clamp.is_some()).then_some((
-            request.wrap_width.unwrap_or(Pixels::MAX),
-            request.line_clamp,
-        ));
-        self.parley_layout(request.text, request.font_size, request.runs, wrap)
-            .expect("Parley failed to lay out a validated GPUI document")
+        self.parley_paragraph_layout(ParleyLayoutParams {
+            text: request,
+            inline: None,
+        })
+        .expect("Parley failed to lay out a validated GPUI document")
+        .layout
+    }
+
+    fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
+        let result = self
+            .parley_layout(ParleyLayoutParams {
+                text: TextLayoutRequest {
+                    text: request.text,
+                    font_size: request.font_size,
+                    runs: request.runs,
+                    wrap_width: request.wrap_width,
+                    line_clamp: request.line_clamp,
+                },
+                inline: Some(ParleyInlineLayoutParams {
+                    boxes: request.boxes,
+                    text_styles: request.text_styles,
+                    line_height: request.line_height,
+                    text_metrics: request.text_metrics,
+                    text_align: request.text_align,
+                }),
+            })
+            .expect("Parley failed to lay out a validated GPUI inline document");
+        InlineLayout {
+            layout: std::sync::Arc::new(result.layout),
+            alignment_offset: inline_alignment_offset(request.text_align, &result.inline_lines),
+            lines: result.inline_lines,
+            boxes: result.inline_boxes,
+            size: result.size,
+        }
     }
 }
 
@@ -1032,11 +1547,18 @@ mod tests {
     };
     use crate::{FontSynthesis, FontVariation, RasterFace};
     use gpui::{
-        CaretSelection, FontFallbacks, FontFeatures as GpuiFontFeatures, FontStyle, FontWeight,
-        GlyphRenderMode, RasterizedGlyphFormat, StrikethroughStyle, TextSystem, UnderlineStyle,
-        WindowTextSystem, font, hsla,
+        AppContext, CaretSelection, Context, FontFallbacks, FontFeatures as GpuiFontFeatures,
+        FontStyle as GpuiFontStyle, FontWeight as GpuiFontWeight, GlyphRenderMode,
+        HeadlessAppContext, HighlightStyle, Hsla, IntoElement, Point, RasterizedGlyphFormat,
+        Render, ScaledPixels, StrikethroughStyle, Styled, StyledText, TextSystem, UnderlineStyle,
+        VerticalAlign, Window, WindowHandle, WindowTextSystem, div, font, hsla, prelude::*,
     };
-    use std::sync::Arc;
+    use std::{cell::Cell, cell::RefCell, rc::Rc, sync::Arc};
+
+    const NOTO_ARABIC: &[u8] =
+        include_bytes!("../../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf");
+    const NOTO_HEBREW: &[u8] =
+        include_bytes!("../../../assets/fonts/noto-sans-hebrew/NotoSansHebrew-Regular.ttf");
 
     #[test]
     fn caret_affinity_round_trips_through_parley() {
@@ -1055,6 +1577,8 @@ mod tests {
                     LILEX.family,
                     SOURCE_SERIF.family,
                     NOTO_COLOR_EMOJI.family,
+                    "Noto Sans Arabic",
+                    "Noto Sans Hebrew",
                 ]),
         );
         system
@@ -1064,6 +1588,8 @@ mod tests {
                 Cow::Borrowed(LILEX.data),
                 Cow::Borrowed(SOURCE_SERIF.data),
                 Cow::Borrowed(NOTO_COLOR_EMOJI.data),
+                Cow::Borrowed(NOTO_ARABIC),
+                Cow::Borrowed(NOTO_HEBREW),
             ])
             .unwrap();
         system
@@ -1113,6 +1639,49 @@ mod tests {
         gpui::WrappedLineLayout {
             layout: Arc::new(layout),
             wrap_width: Some(width),
+        }
+    }
+
+    fn positioned_box_bounds(
+        layout: &InlineLayout,
+        inline_box: &PositionedInlineBox,
+    ) -> Bounds<Pixels> {
+        assert!(
+            inline_box.line_index < layout.lines.len(),
+            "inline box {} refers to missing line {}",
+            inline_box.id,
+            inline_box.line_index
+        );
+        inline_box.bounds
+    }
+
+    fn assert_inline_geometry_is_contained(layout: &InlineLayout, width: Pixels) {
+        let epsilon = px(0.01);
+        for (line_index, line) in layout.lines.iter().enumerate() {
+            assert!(
+                line.origin.x + line.size.width <= width + epsilon,
+                "line {line_index} extends past {width:?}: {line:?}"
+            );
+            assert!(
+                line.origin.y + line.size.height <= layout.size.height + epsilon,
+                "line {line_index} extends past the layout height"
+            );
+        }
+
+        for inline_box in &layout.boxes {
+            let bounds = positioned_box_bounds(layout, inline_box);
+            let line = layout.lines[inline_box.line_index];
+            assert!(
+                bounds.right() <= width + epsilon,
+                "inline box {} extends past the available width",
+                inline_box.id
+            );
+            assert!(
+                bounds.origin.y + epsilon >= line.origin.y
+                    && bounds.bottom() <= line.origin.y + line.size.height + epsilon,
+                "inline box {} is outside its assigned line",
+                inline_box.id
+            );
         }
     }
 
@@ -1205,6 +1774,287 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inline_ranges_forward_font_metrics_and_keep_native_geometry() {
+        let system = test_system();
+
+        let text = "small\nBIG words\nend";
+        let runs = [TextRun {
+            len: text.len(),
+            font: font("IBM Plex Sans"),
+            ..Default::default()
+        }];
+
+        let text_styles = [InlineTextStyle {
+            range: 6..15,
+            font_size: px(30.),
+            line_height: px(46.),
+        }];
+
+        let layout = system.layout_inline(InlineLayoutRequest {
+            text,
+            runs: &runs,
+            text_styles: &text_styles,
+            boxes: &[],
+            font_size: px(14.),
+            line_height: px(20.),
+            text_metrics: InlineTextMetrics {
+                ascent: px(11.),
+                descent: px(3.),
+                x_height: px(7.),
+            },
+
+            wrap_width: Some(px(300.)),
+            line_clamp: None,
+            text_align: TextAlign::Left,
+        });
+
+        assert_eq!(layout.lines.len(), 3);
+        assert!(
+            layout.lines[1].size.height >= px(45.99),
+            "{:?}",
+            layout.lines
+        );
+        assert!(
+            layout
+                .layout
+                .paint_fragments
+                .iter()
+                .any(|fragment| fragment.font_size == px(30.))
+        );
+        assert!(
+            layout
+                .layout
+                .paint_fragments
+                .iter()
+                .any(|fragment| fragment.font_size == px(14.))
+        );
+
+        let native = layout
+            .layout
+            .platform_layout
+            .inline_geometry(16..19)
+            .unwrap();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].visual_line_index, 2);
+        assert!(native[0].bounds.origin.y >= px(65.99), "{native:?}");
+
+        let selection = layout
+            .layout
+            .platform_layout
+            .selection_bounds(16..19, px(20.));
+        assert_eq!(
+            selection[0].origin.y,
+            px(40.),
+            "ordinary selection retains its existing row policy"
+        );
+
+        assert!(
+            layout
+                .layout
+                .platform_layout
+                .inline_geometry(5..6)
+                .unwrap()
+                .is_empty(),
+            "newlines add no span hit region"
+        );
+        assert!(
+            layout
+                .layout
+                .platform_layout
+                .inline_geometry(6..6)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_layout_flows_boxes_with_styled_wrapped_text() {
+        let system = test_system();
+        let text = "alpha beta gamma delta";
+        let split = "alpha beta ".len();
+
+        let first_color = hsla(0.0, 0.8, 0.4, 1.0);
+        let second_color = hsla(0.6, 0.8, 0.4, 1.0);
+
+        let runs = [
+            TextRun {
+                len: split,
+                color: first_color,
+                font: font("IBM Plex Sans"),
+                ..Default::default()
+            },
+            TextRun {
+                len: text.len() - split,
+                color: second_color,
+                font: font("Source Serif 4"),
+                ..Default::default()
+            },
+        ];
+
+        let boxes = [
+            InlineBoxRequest {
+                id: 7,
+                index: "alpha ".len(),
+                size: size(px(28.0), px(32.0)),
+                vertical_align: VerticalAlign::Baseline,
+            },
+            InlineBoxRequest {
+                id: 9,
+                index: split,
+                size: size(px(18.0), px(14.0)),
+                vertical_align: VerticalAlign::Middle,
+            },
+            InlineBoxRequest {
+                id: 11,
+                index: "alpha beta gamma ".len(),
+                size: size(px(20.0), px(18.0)),
+                vertical_align: VerticalAlign::Top,
+            },
+            InlineBoxRequest {
+                id: 13,
+                index: "alpha beta gamma ".len(),
+                size: size(px(16.0), px(28.0)),
+                vertical_align: VerticalAlign::Bottom,
+            },
+        ];
+
+        let text_metrics = InlineTextMetrics {
+            ascent: px(14.0),
+            descent: px(4.0),
+            x_height: px(8.0),
+        };
+
+        let request = InlineLayoutRequest {
+            text_styles: &[],
+            text,
+            runs: &runs,
+            boxes: &boxes,
+            font_size: px(18.0),
+            line_height: px(24.0),
+            text_metrics,
+            wrap_width: Some(px(160.0)),
+            line_clamp: None,
+            text_align: TextAlign::Center,
+        };
+
+        let layout = system.layout_inline(request);
+
+        assert!(layout.lines.len() >= 2);
+        assert_eq!(layout.lines.len(), layout.layout.visual_lines.len());
+        assert_eq!(
+            layout
+                .boxes
+                .iter()
+                .map(|inline_box| inline_box.id)
+                .collect::<Vec<_>>(),
+            vec![7, 9, 11, 13]
+        );
+        assert!(layout.size.width <= px(160.0));
+        assert!(layout.lines.iter().any(|line| line.origin.x > Pixels::ZERO));
+        assert!(
+            layout
+                .layout
+                .paint_fragments
+                .iter()
+                .any(|fragment| fragment.style.color == first_color)
+        );
+        assert!(
+            layout
+                .layout
+                .paint_fragments
+                .iter()
+                .any(|fragment| fragment.style.color == second_color)
+        );
+
+        let box_and_line = |box_id| {
+            let inline_box = layout
+                .boxes
+                .iter()
+                .find(|inline_box| inline_box.id == box_id)
+                .unwrap();
+            let line = &layout.lines[inline_box.line_index];
+            let bounds = positioned_box_bounds(&layout, inline_box);
+            (bounds, line)
+        };
+
+        let (baseline_box, baseline_line) = box_and_line(7);
+        assert!(
+            (baseline_box.bottom() - (baseline_line.origin.y + baseline_line.baseline)).abs()
+                < px(0.01)
+        );
+        let (middle_box, middle_line) = box_and_line(9);
+        assert!(
+            (middle_box.center().y
+                - (middle_line.origin.y + middle_line.baseline - text_metrics.x_height / 2.))
+                .abs()
+                < px(0.01)
+        );
+        let (top_box, top_line) = box_and_line(11);
+        assert!((top_box.origin.y - top_line.origin.y).abs() < px(0.01));
+        let (bottom_box, bottom_line) = box_and_line(13);
+        assert!(
+            (bottom_box.bottom() - (bottom_line.origin.y + bottom_line.size.height)).abs()
+                < px(0.01)
+        );
+
+        for lines in layout.lines.windows(2) {
+            assert!(lines[0].origin.y + lines[0].size.height <= lines[1].origin.y);
+        }
+
+        assert_inline_geometry_is_contained(&layout, px(160.0));
+    }
+
+    #[test]
+    fn inline_layout_supports_documents_containing_only_boxes() {
+        let system = test_system();
+        let boxes = [
+            InlineBoxRequest {
+                id: 1,
+                index: 0,
+                size: size(px(30.0), px(12.0)),
+                vertical_align: VerticalAlign::Baseline,
+            },
+            InlineBoxRequest {
+                id: 2,
+                index: 0,
+                size: size(px(20.0), px(36.0)),
+                vertical_align: VerticalAlign::Middle,
+            },
+        ];
+
+        let layout = system.layout_inline(InlineLayoutRequest {
+            text_styles: &[],
+            text: "",
+            runs: &[],
+            boxes: &boxes,
+            font_size: px(18.0),
+            line_height: px(24.0),
+            text_metrics: InlineTextMetrics {
+                ascent: px(14.0),
+                descent: px(4.0),
+                x_height: px(8.0),
+            },
+            wrap_width: Some(px(24.0)),
+            line_clamp: None,
+            text_align: TextAlign::Left,
+        });
+
+        assert_eq!(layout.boxes.len(), 2);
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.layout.paint_fragments.len(), 0);
+        assert_eq!(
+            layout
+                .boxes
+                .iter()
+                .map(|inline_box| inline_box.line_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(layout.size.width, px(30.0));
+        assert!(layout.size.height >= px(48.0));
+        assert_inline_geometry_is_contained(&layout, layout.size.width);
+    }
+
     trait CloneLineLayoutForTest {
         fn clone_for_test(&self) -> LineLayout;
     }
@@ -1221,6 +2071,129 @@ mod tests {
                 len: self.len,
                 platform_layout: self.platform_layout.clone(),
             }
+        }
+    }
+
+    #[test]
+    fn paragraph_inline_layout_preserves_styles_empty_rows_and_boundary_boxes() {
+        let system = test_system();
+        let text = "אבג\r\nalpha مرحبا omega\r\n\r\n";
+        let split = text.find("مرحبا").unwrap();
+        let runs = [
+            TextRun {
+                len: split,
+                color: hsla(0.2, 0.8, 0.5, 1.),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    ..Default::default()
+                }),
+                ..text_run(text, "IBM Plex Sans")
+            },
+            TextRun {
+                len: text.len() - split,
+                color: hsla(0.7, 0.8, 0.5, 1.),
+                ..text_run(text, "IBM Plex Sans")
+            },
+        ];
+        let styles = [InlineTextStyle {
+            range: split..text.len(),
+            font_size: px(26.),
+            line_height: px(48.),
+        }];
+        let separator = text.find('\r').unwrap();
+        let boxes = [0, separator, separator + 1, separator + 2, text.len()]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, index)| InlineBoxRequest {
+                id: idx as u64,
+                index,
+                size: size(px(10.), px(12.)),
+                vertical_align: VerticalAlign::Baseline,
+            })
+            .collect::<Vec<_>>();
+
+        for text_align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            let inline = system.layout_inline(InlineLayoutRequest {
+                text,
+                runs: &runs,
+                text_styles: &styles,
+                boxes: &boxes,
+                font_size: px(18.),
+                line_height: px(28.),
+                text_metrics: InlineTextMetrics {
+                    ascent: px(16.),
+                    descent: px(4.),
+                    x_height: px(9.),
+                },
+                wrap_width: Some(px(260.)),
+                line_clamp: None,
+                text_align,
+            });
+            let mut ids = inline
+                .boxes
+                .iter()
+                .map(|inline_box| inline_box.id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+
+            assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+            assert_inline_geometry_is_contained(&inline, px(260.));
+            assert_eq!(inline.layout.len, text.len());
+
+            for inline_box in &inline.boxes {
+                let expected_line = match inline_box.id {
+                    0..=2 => 0,
+                    3 => 1,
+                    4 => inline.lines.len() - 1,
+                    _ => unreachable!(),
+                };
+
+                assert_eq!(inline_box.line_index, expected_line);
+            }
+
+            for line in inline.lines.iter().rev().take(2) {
+                assert!(
+                    line.size.height >= px(47.99),
+                    "empty rows must retain styled line height: {line:?}"
+                );
+            }
+
+            let empty_line = inline.lines[inline.lines.len() - 2];
+            let empty_caret = inline
+                .layout
+                .platform_layout
+                .caret_bounds(
+                    CaretPosition::attached_to_next_cluster(text.len() - 2),
+                    px(28.),
+                )
+                .unwrap();
+            assert_eq!(empty_line.size.width, Pixels::ZERO);
+            assert_eq!(empty_caret.origin.x, empty_line.origin.x);
+
+            assert!(
+                inline
+                    .layout
+                    .paint_fragments
+                    .iter()
+                    .any(|fragment| fragment.style.color == runs[0].color
+                        && fragment.style.underline.is_some())
+            );
+            assert!(
+                inline
+                    .layout
+                    .paint_fragments
+                    .iter()
+                    .any(|fragment| fragment.style.color == runs[1].color
+                        && fragment.font_size == px(26.))
+            );
+
+            let regions = inline
+                .layout
+                .platform_layout
+                .inline_geometry(split..text.len())
+                .unwrap();
+            assert!(regions.iter().all(|geometry| geometry.bounds.origin.y
+                >= inline.lines[geometry.visual_line_index].origin.y));
         }
     }
 
@@ -1264,6 +2237,8 @@ mod tests {
         let layout = layout_line(&system, "", px(18.0), &[]);
         assert_document_contract("", &layout);
         assert_eq!(layout.visual_lines[0].text_range, 0..0);
+        assert_eq!(layout.width, Pixels::ZERO);
+        assert!(layout.paint_fragments.is_empty());
     }
 
     #[test]
@@ -1417,8 +2392,8 @@ mod tests {
         assert_ne!(regular, bold);
 
         let mut variable = font(SOURCE_SERIF.family);
-        variable.weight = FontWeight(725.0);
-        variable.style = FontStyle::Oblique;
+        variable.weight = GpuiFontWeight(725.0);
+        variable.style = GpuiFontStyle::Oblique;
         let variable_id = backend.font_id(&variable).unwrap();
         let source_serif_regular = backend.font_id(&font(SOURCE_SERIF.family)).unwrap();
         assert_ne!(source_serif_regular, variable_id);
@@ -1733,4 +2708,6 @@ mod tests {
             Ok(RasterizedGlyph::empty(RasterizedGlyphFormat::AlphaMask))
         }
     }
+
+    mod inline_reflow;
 }

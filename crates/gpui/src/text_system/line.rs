@@ -1,6 +1,6 @@
 use crate::{
-    App, Bounds, LineLayout, PaintFragment, Pixels, Point, Result, SharedString, TextAlign,
-    TextSystem, VisualLine, Window, WrappedLineLayout, fill, point, size,
+    App, Bounds, InlineLayout, LineLayout, PaintFragment, Pixels, Point, Result, SharedString,
+    TextAlign, TextSystem, VisualLine, Window, WrappedLineLayout, fill, point, size,
 };
 use derive_more::{Deref, DerefMut};
 use std::sync::Arc;
@@ -155,6 +155,28 @@ impl WrappedLine {
     }
 }
 
+impl InlineLayout {
+    /// Paint the text-run backgrounds in this inline layout.
+    pub fn paint_background(
+        &self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Result<()> {
+        paint_inline_layout(self, origin, TextPaintPass::Background, window, context)
+    }
+
+    /// Paint the glyphs and foreground decorations in this inline layout.
+    pub fn paint(
+        &self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Result<()> {
+        paint_inline_layout(self, origin, TextPaintPass::Foreground, window, context)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum TextPaintPass {
     Background,
@@ -168,6 +190,58 @@ struct FragmentPaintContext<'a> {
     layout: &'a LineLayout,
     pass: TextPaintPass,
     text_system: &'a TextSystem,
+}
+
+fn paint_inline_layout(
+    inline: &InlineLayout,
+    origin: Point<Pixels>,
+    pass: TextPaintPass,
+    window: &mut Window,
+    context: &mut App,
+) -> Result<()> {
+    if inline.lines.is_empty() {
+        return Ok(());
+    }
+
+    let text_system = context.text_system().clone();
+    let placement = place_inline_layout(origin, inline.alignment_offset, window);
+    window.paint_layer(Bounds::new(placement.origin, inline.size), |window| {
+        for (line, visual_line) in inline.lines.iter().zip(&inline.layout.visual_lines) {
+            let line_origin = origin + line.origin + placement.delta;
+            paint_visual_line(
+                &inline.layout,
+                visual_line,
+                line_origin,
+                line.size.height,
+                line_origin.y + line.baseline,
+                pass,
+                &text_system,
+                window,
+            )?;
+        }
+
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InlineLayoutPlacement {
+    pub(crate) origin: Point<Pixels>,
+    pub(crate) delta: Point<Pixels>,
+}
+
+pub(crate) fn place_inline_layout(
+    content_origin: Point<Pixels>,
+    alignment_offset: Pixels,
+    window: &Window,
+) -> InlineLayoutPlacement {
+    let anchor = content_origin + point(alignment_offset, Pixels::ZERO);
+    let placed_anchor = window.pixel_snap_point(anchor);
+    let delta = placed_anchor - anchor;
+    InlineLayoutPlacement {
+        origin: content_origin + delta,
+        delta,
+    }
 }
 
 fn paint_visual_line(
@@ -214,7 +288,7 @@ fn paint_text_fragment(
 
     let max_glyph_size = context
         .text_system
-        .bounding_box(fragment.font_id, context.layout.font_size)
+        .bounding_box(fragment.font_id, fragment.font_size)
         .size;
     for glyph in &fragment.glyphs {
         let cull_origin = point(
@@ -230,18 +304,13 @@ fn paint_text_fragment(
             context.baseline_y + glyph.position.y,
         );
         if glyph.is_emoji {
-            window.paint_emoji(
-                glyph_origin,
-                fragment.font_id,
-                glyph.id,
-                context.layout.font_size,
-            )?;
+            window.paint_emoji(glyph_origin, fragment.font_id, glyph.id, fragment.font_size)?;
         } else {
             window.paint_glyph(
                 glyph_origin,
                 fragment.font_id,
                 glyph.id,
-                context.layout.font_size,
+                fragment.font_size,
                 fragment.style.color,
             )?;
         }
