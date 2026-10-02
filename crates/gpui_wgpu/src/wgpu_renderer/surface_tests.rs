@@ -11,7 +11,10 @@ use wayland_client::{
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-use super::{NativeBackend, SoftwareAdapterPolicy, WgpuAtlas, WgpuContext, create_surface};
+use super::{
+    NativeBackend, NativeSurfaceTarget, SoftwareAdapterPolicy, WgpuAtlas, WgpuContext,
+    create_surface,
+};
 use crate::{WgpuRenderer, WgpuSurfaceConfig};
 
 #[derive(Default)]
@@ -91,7 +94,11 @@ fn failed_frames_release_surface_images() {
     // presentation images. Keep the Wayland objects alive until after rendering.
     let instance = NativeBackend::Vulkan.instance(Some(Box::new(connection.backend())));
     let handle = WaylandWindowHandle::new(NonNull::new(surface.id().as_ptr().cast()).unwrap());
-    let gpu_surface = create_surface(&instance.raw, RawWindowHandle::Wayland(handle)).unwrap();
+    let gpu_surface = create_surface(
+        &instance.raw,
+        NativeSurfaceTarget::Window(RawWindowHandle::Wayland(handle)),
+    )
+    .unwrap();
     let context = WgpuContext::new_with_adapter_policy(
         instance,
         &gpu_surface,
