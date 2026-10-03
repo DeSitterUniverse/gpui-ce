@@ -2892,6 +2892,11 @@ impl Window {
     }
 
     /// Show the platform character palette.
+    ///
+    /// On macOS and Windows, opens the system character or emoji picker. On Linux,
+    /// opens an installed desktop picker (Plasma, IBus, GNOME Characters, or
+    /// KCharSelect); these pickers may require copying and pasting the selection.
+    /// Logs a warning if the platform has no available picker.
     pub fn show_character_palette(&self) {
         self.platform_window.show_character_palette();
     }

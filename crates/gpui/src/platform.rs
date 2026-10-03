@@ -954,7 +954,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
-    fn show_character_palette(&self) {}
+    /// Show the platform character palette.
+    ///
+    /// The default implementation logs a warning when the backend does not
+    /// support showing a character palette.
+    fn show_character_palette(&self) {
+        log::warn!("show_character_palette is not implemented by this platform backend");
+    }
     fn titlebar_double_click(&self, _is_resizable: bool, _is_minimizable: bool) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
