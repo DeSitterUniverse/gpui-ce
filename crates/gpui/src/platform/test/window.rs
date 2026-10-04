@@ -1,8 +1,8 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GlyphAtlasEntry, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RenderGlyphParams, RequestFrameOptions, Scene, Size, TestPlatform,
+    DispatchEventResult, GlyphAtlasCache, GlyphAtlasEntry, GpuSpecs, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, RenderGlyphParams, RequestFrameOptions, Scene, Size, TestPlatform,
     TextInputConfiguration, TextInputStateChange, TileId, ValidatedRasterizedGlyph,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
@@ -498,7 +498,7 @@ impl PlatformWindow for TestWindow {
 pub(crate) struct TestAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
-    glyph_entries: HashMap<RenderGlyphParams, GlyphAtlasEntry>,
+    glyph_cache: GlyphAtlasCache,
 }
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
@@ -533,7 +533,7 @@ impl TestAtlas {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
-            glyph_entries: HashMap::default(),
+            glyph_cache: GlyphAtlasCache::default(),
         }))
     }
 
@@ -541,7 +541,7 @@ impl TestAtlas {
     pub(crate) fn clear(&self) {
         let mut state = self.0.lock();
         state.tiles.clear();
-        state.glyph_entries.clear();
+        state.glyph_cache.clear();
     }
 }
 
@@ -573,7 +573,7 @@ impl PlatformAtlas for TestAtlas {
         params: &RenderGlyphParams,
         build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
     ) -> anyhow::Result<GlyphAtlasEntry> {
-        if let Some(&entry) = self.0.lock().glyph_entries.get(params) {
+        if let Some(entry) = self.0.lock().glyph_cache.get(params) {
             return Ok(entry);
         }
 
@@ -588,26 +588,12 @@ impl PlatformAtlas for TestAtlas {
             Some(state.insert_tile(key, glyph.size))
         };
 
-        let entry = GlyphAtlasEntry {
-            tile,
-            bounds: glyph.bounds,
-            format: glyph.format,
-        };
-        state.glyph_entries.insert(params.clone(), entry);
-
-        Ok(entry)
+        Ok(state.glyph_cache.insert(params, &glyph, tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
-        if let AtlasKey::Glyph { params, format } = key
-            && state
-                .glyph_entries
-                .get(params)
-                .is_some_and(|entry| entry.format == *format)
-        {
-            state.glyph_entries.remove(params);
-        }
+        state.glyph_cache.remove(key);
         state.tiles.remove(key);
     }
 
@@ -615,7 +601,7 @@ impl PlatformAtlas for TestAtlas {
         let state = self.0.lock();
         match key {
             AtlasKey::Glyph { params, format } => state
-                .glyph_entries
+                .glyph_cache
                 .get(params)
                 .is_some_and(|entry| entry.format == *format),
             _ => state.tiles.contains_key(key),

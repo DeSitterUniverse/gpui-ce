@@ -16,11 +16,11 @@ use uuid::Uuid;
 
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTile, Bounds, Capslock, DevicePixels, DispatchEventResult,
-    DisplayId, GlyphAtlasEntry, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RenderGlyphParams, RequestFrameOptions, Scene, Size, TileId, ValidatedRasterizedGlyph,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
-    px,
+    DisplayId, GlyphAtlasCache, GlyphAtlasEntry, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RenderGlyphParams, RequestFrameOptions, Scene, Size, TileId,
+    ValidatedRasterizedGlyph, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams, px,
 };
 
 #[derive(Debug)]
@@ -244,7 +244,7 @@ struct HeadlessAtlas(Mutex<HeadlessAtlasState>);
 struct HeadlessAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
-    glyph_entries: HashMap<RenderGlyphParams, GlyphAtlasEntry>,
+    glyph_cache: GlyphAtlasCache,
 }
 
 impl HeadlessAtlasState {
@@ -302,7 +302,7 @@ impl PlatformAtlas for HeadlessAtlas {
         params: &RenderGlyphParams,
         build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
     ) -> anyhow::Result<GlyphAtlasEntry> {
-        if let Some(&entry) = self.0.lock().glyph_entries.get(params) {
+        if let Some(entry) = self.0.lock().glyph_cache.get(params) {
             return Ok(entry);
         }
 
@@ -317,26 +317,12 @@ impl PlatformAtlas for HeadlessAtlas {
             Some(state.insert_tile(key, glyph.size))
         };
 
-        let entry = GlyphAtlasEntry {
-            tile,
-            bounds: glyph.bounds,
-            format: glyph.format,
-        };
-        state.glyph_entries.insert(params.clone(), entry);
-
-        Ok(entry)
+        Ok(state.glyph_cache.insert(params, &glyph, tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
-        if let AtlasKey::Glyph { params, format } = key
-            && state
-                .glyph_entries
-                .get(params)
-                .is_some_and(|entry| entry.format == *format)
-        {
-            state.glyph_entries.remove(params);
-        }
+        state.glyph_cache.remove(key);
         state.tiles.remove(key);
     }
 }
