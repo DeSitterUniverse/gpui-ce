@@ -42,6 +42,13 @@ fn main() {
                 .child(
                     div()
                         .absolute()
+                        .left(px(700.0))
+                        .top(px(220.0))
+                        .child("👩🏽‍💻 🇬🇧 1️⃣"),
+                )
+                .child(
+                    div()
+                        .absolute()
                         .left(px(32.0))
                         .top(px(128.0))
                         .w(px(260.0))
@@ -118,6 +125,7 @@ fn main() {
             ("wrapped text", (24.0, 120.0, 320.0, 260.0), 100),
             ("bidi paragraphs", (24.0, 292.0, 650.0, 510.0), 100),
             ("bottom-clipped text", (24.0, 780.0, 700.0, 800.0), 20),
+            ("emoji sequences", (690.0, 200.0, 1000.0, 550.0), 50),
         ] {
             let (left, top, right, bottom) = bounds;
             let changed_pixels = changed_pixels_in(left, top, right, bottom);
