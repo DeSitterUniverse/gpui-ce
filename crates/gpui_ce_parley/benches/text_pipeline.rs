@@ -7,6 +7,7 @@ use gpui_ce_parley::{ParleyTextSystem, SystemFonts};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+#[allow(dead_code)]
 #[path = "../src/font_fixtures.rs"]
 mod font_fixtures;
 

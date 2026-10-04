@@ -16,10 +16,11 @@ use uuid::Uuid;
 
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTile, Bounds, Capslock, DevicePixels, DispatchEventResult,
-    DisplayId, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    Scene, Size, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams, px,
+    DisplayId, GlyphAtlasEntry, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RenderGlyphParams, RequestFrameOptions, Scene, Size, TileId, ValidatedRasterizedGlyph,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    px,
 };
 
 #[derive(Debug)]
@@ -243,6 +244,32 @@ struct HeadlessAtlas(Mutex<HeadlessAtlasState>);
 struct HeadlessAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
+    glyph_entries: HashMap<RenderGlyphParams, GlyphAtlasEntry>,
+}
+
+impl HeadlessAtlasState {
+    fn insert_tile(&mut self, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        self.next_id += 1;
+        let texture_id = self.next_id;
+        self.next_id += 1;
+        let tile_id = self.next_id;
+        let tile = AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture_id,
+                kind: key.texture_kind(),
+            },
+            tile_id: TileId(tile_id),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size,
+            },
+        };
+
+        self.tiles.insert(key, tile);
+
+        tile
+    }
 }
 
 impl PlatformAtlas for HeadlessAtlas {
@@ -265,27 +292,51 @@ impl PlatformAtlas for HeadlessAtlas {
         };
 
         let mut state = self.0.lock();
-        state.next_id += 1;
-        let texture_id = state.next_id;
-        state.next_id += 1;
-        let tile_id = state.next_id;
-        let tile = AtlasTile {
-            texture_id: AtlasTextureId {
-                index: texture_id,
-                kind: key.texture_kind(),
-            },
-            tile_id: TileId(tile_id),
-            padding: 0,
-            bounds: Bounds {
-                origin: Point::default(),
-                size,
-            },
-        };
-        state.tiles.insert(key.clone(), tile);
+        let tile = state.insert_tile(key.clone(), size);
+
         Ok(Some(tile))
     }
 
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &RenderGlyphParams,
+        build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
+    ) -> anyhow::Result<GlyphAtlasEntry> {
+        if let Some(&entry) = self.0.lock().glyph_entries.get(params) {
+            return Ok(entry);
+        }
+
+        let glyph = build()?;
+
+        let mut state = self.0.lock();
+        let tile = if glyph.size == Size::default() {
+            None
+        } else {
+            let key = (params.clone(), glyph.format).into();
+
+            Some(state.insert_tile(key, glyph.size))
+        };
+
+        let entry = GlyphAtlasEntry {
+            tile,
+            bounds: glyph.bounds,
+            format: glyph.format,
+        };
+        state.glyph_entries.insert(params.clone(), entry);
+
+        Ok(entry)
+    }
+
     fn remove(&self, key: &AtlasKey) {
-        self.0.lock().tiles.remove(key);
+        let mut state = self.0.lock();
+        if let AtlasKey::Glyph { params, format } = key
+            && state
+                .glyph_entries
+                .get(params)
+                .is_some_and(|entry| entry.format == *format)
+        {
+            state.glyph_entries.remove(params);
+        }
+        state.tiles.remove(key);
     }
 }
