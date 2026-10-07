@@ -101,8 +101,9 @@ pub trait AnimationExt {
     /// still uses the App epoch independently of its placement, including at
     /// handoff. Frame throttling follows the selected animation.
     ///
-    /// An unbounded animation or overflowing duration makes later animations
-    /// unreachable.
+    /// During normal playback, an unbounded animation or overflowing duration
+    /// makes later animations unreachable. Reduced motion preserves the existing
+    /// policy of resolving the last authored animation to its resting value.
     fn with_animations(
         self,
         id: impl Into<ElementId>,
