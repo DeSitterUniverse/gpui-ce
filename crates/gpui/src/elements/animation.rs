@@ -86,6 +86,7 @@ pub trait AnimationExt {
             animator: Box::new(move |this, _, value| animator(this, value)),
             animations: smallvec::smallvec![animation],
             timing,
+            replay_key: None,
         }
     }
 
@@ -118,6 +119,7 @@ pub trait AnimationExt {
             animator: Box::new(animator),
             animations: animations.into(),
             timing,
+            replay_key: None,
         }
     }
 
@@ -166,6 +168,7 @@ pub struct AnimationElement<E> {
     element: Option<E>,
     animations: SmallVec<[Animation; 1]>,
     timing: AnimationSchedule,
+    replay_key: Option<ElementId>,
     animator: Box<dyn Fn(E, usize, f32) -> E + 'static>,
 }
 
@@ -218,6 +221,25 @@ impl<E: ParentElement> ParentElement for AnimationElement<E> {
 }
 
 impl<E> AnimationElement<E> {
+    /// Restarts the animation when `event_id` changes between renders.
+    ///
+    /// Keep the animation's element ID stable and change this key for each
+    /// application event, including events with identical payloads. An unchanged
+    /// key leaves the run's elapsed clock unchanged. The first mount still
+    /// animates normally.
+    /// Replay restarts at the configured origin and delay, even during an active
+    /// run. It does not remount the element or its children.
+    ///
+    /// Reduced motion resolves a replay to its resting value and consumes the
+    /// event, even if the preference is disabled before the next layout. A new
+    /// key observed after disabling the preference can start another run.
+    /// Synchronized animations retain their App epoch;
+    /// use an ordinary [`Animation`] for an event-local phase.
+    pub fn replay_on(mut self, event_id: impl Into<ElementId>) -> Self {
+        self.replay_key = Some(event_id.into());
+        self
+    }
+
     /// Returns a new [`AnimationElement<E>`] after applying the given function
     /// to the element being animated.
     pub fn map_element(mut self, f: impl FnOnce(E) -> E) -> AnimationElement<E> {
@@ -237,6 +259,9 @@ impl<E: IntoElement + 'static> IntoElement for AnimationElement<E> {
 struct AnimationState {
     start: Instant,
     animation_ix: usize,
+    replay_key: Option<ElementId>,
+    reduced_replay: bool,
+    preference_epoch: u64,
     /// Whether a throttled re-render (see [`Animation::with_max_fps`]) is
     /// already scheduled, so overlapping renders don't stack extra timers.
     delayed_frame_pending: Rc<Cell<bool>>,
@@ -490,19 +515,42 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
             let now = cx.background_executor().now();
+            let preference_epoch = cx
+                .try_global::<crate::AnimationPreference>()
+                .map_or(0, |preference| preference.0);
             let mut state = state.unwrap_or_else(|| AnimationState {
                 start: now,
                 animation_ix: 0,
+                replay_key: self.replay_key.clone(),
+                reduced_replay: false,
+                preference_epoch,
                 delayed_frame_pending: Rc::new(Cell::new(false)),
                 delayed_frame: None,
                 delayed_frame_interval: None,
             });
+            if state.replay_key != self.replay_key {
+                state.reduced_replay = false;
+                state.preference_epoch = preference_epoch;
+                if self.replay_key.is_some() {
+                    state.start = now;
+                    state.animation_ix = 0;
+                    state.delayed_frame = None;
+                    state.delayed_frame_pending = Rc::new(Cell::new(false));
+                }
+                state.replay_key = self.replay_key.clone();
+            }
+            if self.replay_key.is_some()
+                && (cx.reduce_motion() || state.preference_epoch != preference_epoch)
+            {
+                state.reduced_replay = true;
+            }
+            state.preference_epoch = preference_epoch;
             let selected = animation_sequence_sample(
                 &self.animations,
                 &self.timing,
                 now - state.start,
                 now - cx.synced_animation_epoch,
-                cx.reduce_motion(),
+                cx.reduce_motion() || state.reduced_replay,
             );
             let (animation_ix, delta, done) = if let Some((animation_ix, delta, done)) = selected {
                 if state.animation_ix != animation_ix {
@@ -642,6 +690,10 @@ mod easing {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "animation/replay_tests.rs"]
+mod replay_tests;
 
 #[cfg(test)]
 mod tests {
